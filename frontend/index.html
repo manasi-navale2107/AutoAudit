@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#142238">
+  <meta name="description" content="Plan ML experiments, review data preparation, and train models with AutoAudit.">
+
+  <title>AutoAudit | ML Workspace</title>
+
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/css/styles.css">
+
+  <script type="module" src="/static/js/app.js"></script>
+</head>
+
+<body data-api-base="/api" data-app-state="booting">
+  <a class="skip-link" href="#main-content" data-i18n="app.skip">
+    Skip to workspace
+  </a>
+
+  <noscript>
+    <p class="notice notice--error" role="alert">
+      Enable JavaScript to upload datasets and manage runs.
+    </p>
+  </noscript>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-labelledby="history-heading">
+      <a class="brand" href="/" aria-label="AutoAudit home">
+        <span class="brand-mark" aria-hidden="true">AA</span>
+        <span class="brand-name">AutoAudit</span>
+      </a>
+
+      <button
+        id="new-run-button"
+        class="button button--primary"
+        type="button"
+        data-i18n="actions.newRun"
+        disabled
+      >
+        New run
+      </button>
+
+      <div class="section-heading">
+        <h2 id="history-heading" data-i18n="history.title">
+          Recent runs
+        </h2>
+
+        <button
+          id="refresh-runs-button"
+          class="button button--quiet"
+          type="button"
+          data-i18n="actions.refresh"
+          disabled
+        >
+          Refresh
+        </button>
+      </div>
+
+      <nav aria-labelledby="history-heading">
+        <ul id="run-list" class="run-list"></ul>
+
+        <p
+          id="run-list-empty"
+          class="muted"
+          data-i18n="history.empty"
+          hidden
+        >
+          No runs yet.
+        </p>
+      </nav>
+
+      <p
+        id="run-list-status"
+        class="muted"
+        role="status"
+        aria-live="polite"
+      ></p>
+
+      <div class="sidebar-footer">
+        <a
+          href="/docs"
+          target="_blank"
+          rel="noopener noreferrer"
+          data-i18n="app.apiDocs"
+        >
+          API documentation
+        </a>
+      </div>
+    </aside>
+
+    <main id="main-content" class="workspace" tabindex="-1">
+      <header class="workspace-header">
+        <h1 data-i18n="app.workspace">ML workspace</h1>
+
+        <div class="header-controls">
+          <span
+            id="connection-status"
+            class="badge"
+            role="status"
+            aria-live="polite"
+            data-state="unknown"
+            data-i18n="connection.unchecked"
+          >
+            Connection not checked
+          </span>
+
+          <div class="field field--compact">
+            <label
+              for="interface-language"
+              data-i18n="settings.interfaceLanguage"
+            >
+              Interface language
+            </label>
+
+            <select id="interface-language" disabled>
+              <option value="en" lang="en" selected>English</option>
+              <option value="mr" lang="mr">मराठी</option>
+              <option value="hi" lang="hi">हिन्दी</option>
+            </select>
+          </div>
+        </div>
+      </header>
+
+      <div
+        id="app-error"
+        class="notice notice--error"
+        role="alert"
+        hidden
+      >
+        <p id="app-error-message"></p>
+
+        <button
+          id="retry-connection-button"
+          class="button button--secondary"
+          type="button"
+          data-i18n="actions.reconnect"
+          disabled
+        >
+          Reconnect
+        </button>
+      </div>
+
+      <p
+        id="app-message"
+        class="notice"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      ></p>
+
+      <section
+        id="new-run-panel"
+        class="panel"
+        aria-labelledby="new-run-heading"
+      >
+        <div class="panel-heading">
+          <h2 id="new-run-heading" data-i18n="run.new">
+            New experiment
+          </h2>
+        </div>
+
+        <div class="setup-grid">
+          <section
+            class="setup-section"
+            aria-labelledby="dataset-heading"
+          >
+            <h3 id="dataset-heading" data-i18n="dataset.title">
+              1. Choose a dataset
+            </h3>
+
+            <form
+              id="upload-form"
+              action="/api/datasets"
+              method="post"
+              enctype="multipart/form-data"
+            >
+              <fieldset id="upload-fields" disabled>
+                <legend
+                  class="sr-only"
+                  data-i18n="dataset.uploadLegend"
+                >
+                  Upload a CSV dataset
+                </legend>
+
+                <div class="file-picker">
+                  <label
+                    for="dataset-file"
+                    data-i18n="dataset.csvFile"
+                  >
+                    CSV file
+                  </label>
+
+                  <input
+                    id="dataset-file"
+                    name="file"
+                    type="file"
+                    accept=".csv,text/csv"
+                    aria-describedby="upload-help upload-error"
+                    required
+                  >
+
+                  <p
+                    id="upload-help"
+                    class="field-help"
+                    data-i18n="dataset.uploadHelp"
+                  >
+                    UTF-8 CSV, up to 25 MB.
+                    Use 10–100,000 rows and 2–100 columns.
+                  </p>
+                </div>
+
+                <button
+                  id="upload-button"
+                  class="button button--secondary"
+                  type="submit"
+                  data-i18n="actions.upload"
+                >
+                  Upload dataset
+                </button>
+              </fieldset>
+            </form>
+
+            <progress
+              id="upload-progress"
+              aria-label="Uploading dataset"
+              data-i18n-aria-label="dataset.uploading"
+              hidden
+            ></progress>
+
+            <p
+              id="upload-status"
+              class="field-help"
+              role="status"
+              aria-live="polite"
+            ></p>
+
+            <p
+              id="upload-error"
+              class="field-error"
+              role="alert"
+              hidden
+            ></p>
+
+            <div class="field">
+              <label
+                for="dataset-select"
+                data-i18n="dataset.saved"
+              >
+                Or use a saved dataset
+              </label>
+
+              <select id="dataset-select" disabled>
+                <option value="" data-i18n="dataset.chooseSaved">
+                  Choose a saved dataset
+                </option>
+              </select>
+            </div>
+
+            <div
+              id="dataset-summary"
+              class="dataset-summary"
+              hidden
+            >
+              <h4 id="dataset-filename" class="break-word"></h4>
+
+              <dl class="stat-grid">
+                <div>
+                  <dt data-i18n="dataset.rows">Rows</dt>
+                  <dd id="dataset-row-count"></dd>
+                </div>
+
+                <div>
+                  <dt data-i18n="dataset.columns">Columns</dt>
+                  <dd id="dataset-column-count"></dd>
+                </div>
+
+                <div>
+                  <dt data-i18n="dataset.size">File size</dt>
+                  <dd id="dataset-size"></dd>
+                </div>
+              </dl>
+
+              <details id="dataset-profile-panel">
+                <summary data-i18n="dataset.profile">
+                  Dataset profile
+                </summary>
+
+                <p
+                  id="dataset-profile-status"
+                  class="field-help"
+                  role="status"
+                ></p>
+
+                <pre
+                  id="dataset-profile-json"
+                  class="json-view"
+                  tabindex="0"
+                  aria-label="Dataset profile"
+                  data-i18n-aria-label="dataset.profile"
+                ></pre>
+              </details>
+            </div>
+          </section>
+
+          <section
+            class="setup-section"
+            aria-labelledby="objective-heading"
+          >
+            <h3
+              id="objective-heading"
+              data-i18n="run.objectiveHeading"
+            >
+              2. Describe your goal
+            </h3>
+
+            <form
+              id="run-form"
+              action="/api/runs"
+              method="post"
+              autocomplete="off"
+            >
+              <fieldset id="run-fields" disabled>
+                <legend class="sr-only" data-i18n="run.settings">
+                  Experiment settings
+                </legend>
+
+                <div class="field">
+                  <label
+                    for="objective"
+                    data-i18n="run.objective"
+                  >
+                    Problem statement
+                  </label>
+
+                  <textarea
+                    id="objective"
+                    name="objective"
+                    rows="6"
+                    minlength="5"
+                    maxlength="5000"
+                    aria-describedby="objective-help objective-length"
+                    required
+                  ></textarea>
+
+                  <p
+                    id="objective-help"
+                    class="field-help"
+                    data-i18n="run.objectiveHelp"
+                  >
+                    Describe the prediction, what each row represents,
+                    and which features are available at prediction time.
+                  </p>
+
+                  <p
+                    id="objective-length"
+                    class="character-count"
+                  >
+                    <span id="objective-count">0</span> / 5000
+                  </p>
+                </div>
+
+                <!-- Revealed by voice.js when voice input is available. -->
+                <div
+                  id="voice-controls"
+                  class="voice-controls"
+                  hidden
+                >
+                  <button
+                    id="voice-input-button"
+                    class="button button--quiet"
+                    type="button"
+                    aria-pressed="false"
+                    aria-describedby="voice-status"
+                    data-i18n="voice.dictate"
+                    disabled
+                  >
+                    Dictate problem statement
+                  </button>
+
+                  <p
+                    id="voice-status"
+                    class="field-help"
+                    role="status"
+                    aria-live="polite"
+                  ></p>
+                </div>
+
+                <div class="field">
+                  <label
+                    for="target-column"
+                    data-i18n="run.target"
+                  >
+                    Target column
+                  </label>
+
+                  <select
+                    id="target-column"
+                    name="target_column"
+                  >
+                    <option value="" data-i18n="run.inferTarget">
+                      Let the planner identify it
+                    </option>
+                  </select>
+                </div>
+
+                <div class="form-grid">
+                  <div class="field">
+                    <label
+                      for="llm-provider"
+                      data-i18n="settings.provider"
+                    >
+                      LLM provider
+                    </label>
+
+                    <select
+                      id="llm-provider"
+                      name="provider"
+                      aria-describedby="provider-help"
+                    >
+                      <option
+                        value=""
+                        data-i18n="settings.projectDefault"
+                      >
+                        Project default
+                      </option>
+                      <option value="groq">Groq</option>
+                      <option value="ollama">Ollama</option>
+                    </select>
+                  </div>
+
+                  <div class="field">
+                    <label
+                      for="response-language"
+                      data-i18n="settings.responseLanguage"
+                    >
+                      Agent response language
+                    </label>
+
+                    <select
+                      id="response-language"
+                      name="language"
+                    >
+                      <option
+                        value=""
+                        data-i18n="settings.projectDefault"
+                      >
+                        Project default
+                      </option>
+                      <option value="en" lang="en">English</option>
+                      <option value="mr" lang="mr">मराठी</option>
+                      <option value="hi" lang="hi">हिन्दी</option>
+                    </select>
+                  </div>
+                </div>
+
+                <p
+                  id="provider-help"
+                  class="field-help"
+                  data-i18n="settings.providerHelp"
+                >
+                  Uses the model configured for the selected provider.
+                </p>
+
+                <p
+                  class="review-hint"
+                  data-i18n="run.approvalHint"
+                >
+                  You will review the proposed data preparation
+                  before training starts.
+                </p>
+
+                <button
+                  id="start-run-button"
+                  class="button button--primary"
+                  type="submit"
+                  data-i18n="actions.startRun"
+                >
+                  Create plan
+                </button>
+              </fieldset>
+
+              <p
+                id="run-form-error"
+                class="field-error"
+                role="alert"
+                hidden
+              ></p>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <section
+        id="run-panel"
+        class="panel run-panel"
+        aria-labelledby="run-heading"
+        tabindex="-1"
+        hidden
+      >
+        <header class="panel-heading">
+          <div>
+            <h2 id="run-heading" data-i18n="run.details">
+              Run details
+            </h2>
+
+            <p class="run-reference">
+              <span data-i18n="run.id">Run ID</span>:
+              <code id="active-run-id"></code>
+            </p>
+          </div>
+
+          <div class="action-row">
+            <span
+              id="run-status"
+              class="badge"
+              role="status"
+              aria-live="polite"
+            ></span>
+
+            <button
+              id="refresh-run-button"
+              class="button button--quiet"
+              type="button"
+              data-i18n="actions.refresh"
+              disabled
+            >
+              Refresh
+            </button>
+          </div>
+        </header>
+
+        <p
+          id="active-run-objective"
+          class="preserve-lines"
+        ></p>
+
+        <dl
+          id="active-run-settings"
+          class="definition-grid"
+        ></dl>
+
+        <ol
+          class="agent-steps"
+          aria-label="Agent progress"
+          data-i18n-aria-label="agents.progress"
+        >
+          <li
+            id="planner-step"
+            data-agent="planner"
+            data-status="waiting"
+          >
+            <span class="step-number" aria-hidden="true">01</span>
+            <div>
+              <h3 data-i18n="agents.planner">Planner</h3>
+              <p id="planner-status" data-i18n="status.waiting">
+                Waiting
+              </p>
+            </div>
+          </li>
+
+          <li
+            id="engineering-step"
+            data-agent="data_engineering"
+            data-status="waiting"
+          >
+            <span class="step-number" aria-hidden="true">02</span>
+            <div>
+              <h3 data-i18n="agents.engineering">
+                Data Engineering
+              </h3>
+              <p
+                id="engineering-status"
+                data-i18n="status.waiting"
+              >
+                Waiting
+              </p>
+            </div>
+          </li>
+
+          <li
+            id="training-step"
+            data-agent="model_training"
+            data-status="waiting"
+          >
+            <span class="step-number" aria-hidden="true">03</span>
+            <div>
+              <h3 data-i18n="agents.training">Model Training</h3>
+              <p id="training-status" data-i18n="status.waiting">
+                Waiting
+              </p>
+            </div>
+          </li>
+        </ol>
+
+        <progress
+          id="run-progress"
+          aria-label="Run in progress"
+          data-i18n-aria-label="run.inProgress"
+          hidden
+        ></progress>
+
+        <section
+          id="plan-panel"
+          class="result-section"
+          aria-labelledby="plan-heading"
+          hidden
+        >
+          <h3 id="plan-heading" data-i18n="plan.title">
+            Execution plan
+          </h3>
+
+          <dl id="plan-summary" class="definition-grid"></dl>
+
+          <details>
+            <summary data-i18n="plan.full">Full plan</summary>
+            <pre
+              id="plan-json"
+              class="json-view"
+              tabindex="0"
+              aria-label="Execution plan"
+              data-i18n-aria-label="plan.title"
+            ></pre>
+          </details>
+        </section>
+
+        <section
+          id="clarification-panel"
+          class="review-panel"
+          aria-labelledby="clarification-heading"
+          hidden
+        >
+          <h3
+            id="clarification-heading"
+            data-i18n="clarification.title"
+          >
+            The planner needs more information
+          </h3>
+
+          <ol
+            id="clarification-questions"
+            class="question-list"
+          ></ol>
+
+          <form
+            id="clarification-form"
+            method="post"
+            action="#"
+          >
+            <fieldset id="clarification-fields" disabled>
+              <legend
+                class="sr-only"
+                data-i18n="clarification.answerLegend"
+              >
+                Answer the planner
+              </legend>
+
+              <div class="field">
+                <label
+                  for="clarification-answer"
+                  data-i18n="clarification.answer"
+                >
+                  Your answers
+                </label>
+
+                <textarea
+                  id="clarification-answer"
+                  name="feedback"
+                  rows="4"
+                  maxlength="4000"
+                  aria-describedby="clarification-help clarification-error"
+                  required
+                ></textarea>
+
+                <p
+                  id="clarification-help"
+                  class="field-help"
+                  data-i18n="clarification.help"
+                >
+                  Answer each question in order.
+                  Maximum 4,000 characters.
+                </p>
+              </div>
+
+              <div class="action-row">
+                <button
+                  id="submit-clarification-button"
+                  class="button button--primary"
+                  type="submit"
+                  data-i18n="actions.submitAnswers"
+                >
+                  Submit answers
+                </button>
+
+                <button
+                  id="reject-clarification-button"
+                  class="button button--danger"
+                  type="button"
+                  data-i18n="actions.rejectRun"
+                >
+                  Reject run
+                </button>
+              </div>
+            </fieldset>
+
+            <p
+              id="clarification-error"
+              class="field-error"
+              role="alert"
+              hidden
+            ></p>
+          </form>
+        </section>
+
+        <section
+          id="review-panel"
+          class="review-panel"
+          aria-labelledby="review-heading"
+          hidden
+        >
+          <div class="section-heading">
+            <h3 id="review-heading" data-i18n="review.title">
+              Review proposed data preparation
+            </h3>
+
+            <p class="revision">
+              <span data-i18n="review.revision">Revision</span>
+              <span id="review-revision"></span>
+            </p>
+          </div>
+
+          <p
+            id="proposal-summary"
+            class="preserve-lines"
+          ></p>
+
+          <div
+            class="table-scroll"
+            role="region"
+            tabindex="0"
+            aria-labelledby="policy-table-caption"
+          >
+            <table class="data-table">
+              <caption
+                id="policy-table-caption"
+                data-i18n="review.columnChanges"
+              >
+                Proposed changes by column
+              </caption>
+
+              <thead>
+                <tr>
+                  <th scope="col" data-i18n="review.column">
+                    Column
+                  </th>
+                  <th scope="col" data-i18n="review.action">
+                    Action
+                  </th>
+                  <th scope="col" data-i18n="review.type">
+                    Type
+                  </th>
+                  <th scope="col" data-i18n="review.missing">
+                    Missing values
+                  </th>
+                  <th scope="col" data-i18n="review.scaling">
+                    Scaling
+                  </th>
+                  <th scope="col" data-i18n="review.encoding">
+                    Encoding
+                  </th>
+                  <th scope="col" data-i18n="review.reason">
+                    Reason
+                  </th>
+                </tr>
+              </thead>
+
+              <tbody id="policy-table-body"></tbody>
+            </table>
+          </div>
+
+          <div
+            id="cleaning-questions-panel"
+            class="notice notice--warning"
+            hidden
+          >
+            <h4 data-i18n="review.unresolved">
+              Questions to resolve
+            </h4>
+            <ul id="cleaning-questions"></ul>
+          </div>
+
+          <form id="review-form" method="post" action="#">
+            <fieldset id="review-fields" disabled>
+              <legend
+                class="sr-only"
+                data-i18n="review.decision"
+              >
+                Your review decision
+              </legend>
+
+              <div class="field">
+                <label
+                  for="review-feedback"
+                  data-i18n="review.feedback"
+                >
+                  Feedback
+                </label>
+
+                <textarea
+                  id="review-feedback"
+                  name="feedback"
+                  rows="3"
+                  maxlength="4000"
+                  aria-describedby="review-feedback-help review-error"
+                ></textarea>
+
+                <p
+                  id="review-feedback-help"
+                  class="field-help"
+                  data-i18n="review.feedbackHelp"
+                >
+                  Required when requesting changes.
+                  Maximum 4,000 characters.
+                </p>
+              </div>
+
+              <div class="action-row">
+                <button
+                  id="approve-review-button"
+                  class="button button--primary"
+                  type="button"
+                  data-review-action="approve"
+                  data-i18n="actions.approveTrain"
+                >
+                  Approve and train
+                </button>
+
+                <button
+                  id="change-review-button"
+                  class="button button--secondary"
+                  type="button"
+                  data-review-action="changes"
+                  data-i18n="actions.requestChanges"
+                >
+                  Request changes
+                </button>
+
+                <button
+                  id="reject-review-button"
+                  class="button button--danger"
+                  type="button"
+                  data-review-action="reject"
+                  data-i18n="actions.rejectRun"
+                >
+                  Reject run
+                </button>
+              </div>
+            </fieldset>
+
+            <p
+              id="review-error"
+              class="field-error"
+              role="alert"
+              hidden
+            ></p>
+
+            <p
+              id="review-submit-status"
+              class="field-help"
+              role="status"
+              aria-live="polite"
+            ></p>
+          </form>
+        </section>
+
+        <section
+          id="run-error-panel"
+          class="notice notice--error"
+          aria-labelledby="run-error-heading"
+          hidden
+        >
+          <h3
+            id="run-error-heading"
+            data-i18n="run.attention"
+          >
+            This run needs attention
+          </h3>
+
+          <p id="run-error-message" role="alert"></p>
+
+          <button
+            id="retry-run-button"
+            class="button button--secondary"
+            type="button"
+            data-i18n="actions.retryRun"
+            disabled
+            hidden
+          >
+            Retry run
+          </button>
+        </section>
+
+        <section
+          id="training-results-panel"
+          class="result-section"
+          aria-labelledby="training-results-heading"
+          hidden
+        >
+          <h3
+            id="training-results-heading"
+            data-i18n="training.title"
+          >
+            Training results
+          </h3>
+
+          <dl id="training-summary" class="stat-grid"></dl>
+
+          <p
+            class="field-help"
+            data-i18n="training.validationHelp"
+          >
+            These scores use the validation split.
+            The test split is reserved for the next stage.
+          </p>
+
+          <div
+            class="table-scroll"
+            role="region"
+            tabindex="0"
+            aria-labelledby="model-table-caption"
+          >
+            <table class="data-table">
+              <caption
+                id="model-table-caption"
+                data-i18n="training.comparison"
+              >
+                Candidate model results
+              </caption>
+
+              <thead>
+                <tr>
+                  <th scope="col" data-i18n="training.model">
+                    Model
+                  </th>
+                  <th scope="col" data-i18n="training.status">
+                    Status
+                  </th>
+                  <th scope="col" data-i18n="training.score">
+                    Primary validation score
+                  </th>
+                  <th scope="col" data-i18n="training.notes">
+                    Notes
+                  </th>
+                </tr>
+              </thead>
+
+              <tbody id="model-table-body"></tbody>
+            </table>
+          </div>
+
+          <dl
+            id="artifact-summary"
+            class="definition-grid"
+          ></dl>
+
+          <div class="action-row">
+            <button
+              id="download-report-button"
+              class="button button--secondary"
+              type="button"
+              data-i18n="actions.downloadReport"
+              disabled
+            >
+              Download report JSON
+            </button>
+
+            <button
+              id="download-manifest-button"
+              class="button button--quiet"
+              type="button"
+              data-i18n="actions.downloadManifest"
+              disabled
+            >
+              Download manifest JSON
+            </button>
+          </div>
+
+          <details>
+            <summary data-i18n="training.fullReport">
+              Full training report
+            </summary>
+
+            <pre
+              id="training-report-json"
+              class="json-view"
+              tabindex="0"
+              aria-label="Training report"
+              data-i18n-aria-label="training.fullReport"
+            ></pre>
+          </details>
+        </section>
+
+        <p class="updated-at">
+          <span data-i18n="run.updated">Last updated</span>:
+          <time id="run-updated-at"></time>
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <!--
+    Clone templates in app.js/review.js.
+    Insert API and LLM text using textContent.
+  -->
+
+  <template id="run-item-template">
+    <li class="run-list-item">
+      <button class="run-list-button" type="button">
+        <span class="run-list-title" data-field="title"></span>
+        <span class="run-list-status" data-field="status"></span>
+        <time class="run-list-time" data-field="updated_at"></time>
+      </button>
+    </li>
+  </template>
+
+  <template id="policy-row-template">
+    <tr>
+      <th scope="row" data-field="column"></th>
+      <td data-field="action"></td>
+      <td data-field="feature_kind"></td>
+      <td data-field="missing_strategy"></td>
+      <td data-field="scaling"></td>
+      <td data-field="encoding"></td>
+      <td class="preserve-lines" data-field="reason"></td>
+    </tr>
+  </template>
+
+  <template id="model-row-template">
+    <tr>
+      <th scope="row" data-field="model"></th>
+      <td data-field="status"></td>
+      <td data-field="primary_score"></td>
+      <td class="preserve-lines" data-field="notes"></td>
+    </tr>
+  </template>
+</body>
+</html>

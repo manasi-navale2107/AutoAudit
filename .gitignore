@@ -1,0 +1,30 @@
+# Local environment files and secrets
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+
+# Python virtual environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Uploaded datasets, run state and generated artifacts
+/runtime/
+/logs/
+*.log
+*.db
+*.db-*
+*.sqlite*
+*.joblib
+*.pkl
+
+# Local editor settings
+.vscode/
+.idea/

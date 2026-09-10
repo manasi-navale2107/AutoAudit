@@ -1,0 +1,80 @@
+# ============================================================
+# AUTOAUDIT — CORE DEPENDENCIES
+# Python: 3.11
+#
+# These are bounded development dependencies.
+# An exact dependency lock will be created after integration
+# testing on the target environment, before deployment.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# BACKEND API
+# ------------------------------------------------------------
+
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
+
+# Dataset and audio uploads through multipart/form-data.
+python-multipart>=0.0.20,<1.0.0
+
+
+# ------------------------------------------------------------
+# VALIDATION AND CONFIGURATION
+# ------------------------------------------------------------
+
+pydantic>=2.10.0,<3.0.0
+pydantic-settings>=2.6.0,<3.0.0
+
+
+# ------------------------------------------------------------
+# AGENT WORKFLOW AND HUMAN-IN-THE-LOOP
+# ------------------------------------------------------------
+
+langgraph>=1.0.0,<2.0.0
+langgraph-checkpoint-sqlite>=3.0.0,<4.0.0
+
+# Shared messages, prompts and structured model interfaces.
+langchain-core>=1.0.0,<2.0.0
+
+
+# ------------------------------------------------------------
+# LLM PROVIDERS
+# ------------------------------------------------------------
+
+langchain-ollama>=1.0.0,<2.0.0
+langchain-groq>=1.0.0,<2.0.0
+
+
+# ------------------------------------------------------------
+# DATA PROCESSING AND MACHINE LEARNING
+# ------------------------------------------------------------
+
+numpy>=1.26.4,<3.0.0
+pandas>=2.2.3,<3.0.0
+scikit-learn>=1.5.2,<2.0.0
+
+# Save application-generated preprocessing/model artifacts.
+joblib>=1.4.2,<2.0.0
+
+
+# ------------------------------------------------------------
+# ASYNCHRONOUS SQLITE STORAGE
+# ------------------------------------------------------------
+
+aiosqlite>=0.20.0,<1.0.0
+
+
+# ------------------------------------------------------------
+# HTTP CLIENT
+# ------------------------------------------------------------
+
+httpx>=0.28.1,<1.0.0
+
+
+# ------------------------------------------------------------
+# VOICE
+# ------------------------------------------------------------
+
+# Optional speech dependencies belong in requirements-voice.txt.
+# Browser audio recording uses frontend JavaScript.
