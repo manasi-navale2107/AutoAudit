@@ -27,4 +27,16 @@ __pycache__/
 
 # Local editor settings
 .vscode/
-.idea/
+.idea/.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.bak
+runtime/
+*.log
+AutoAudit_Blueprint_Fix_Package.zip
+fix_autoaudit_blueprint.py
+verify_autoaudit_blueprint.py

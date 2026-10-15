@@ -1,44 +1,48 @@
-"""
-Planner Agent for AutoAudit.
 
-Responsibilities:
-- Prepare bounded planning context.
-- Invoke the configured LLM using PlannerDecision.
-- Validate the returned plan against actual dataset information.
-- Return clarification when the target is missing or ambiguous.
+"""AutoAudit Planner Agent.
 
-The full DataFrame is used locally for consistency checks.
-Raw dataset rows are not included in the LLM request.
-
-The agent does not perform cleaning, splitting, training,
-human approval, or pipeline auditing.
+Legacy plan() returns the existing validated classification PlannerDecision.
+New plan_project() returns an end-to-end project file blueprint.
+No file creation, cleaning, training, or packaging happens in this agent.
 """
 
 import asyncio
 import json
 import math
+import re
 
 from collections.abc import Sequence
 
 import pandas as pd
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import Settings, get_settings
 from app.core.logging_config import get_logger
-
 from app.llm.provider_factory import LLMProvider
-
 from app.schemas.dataset import DatasetProfile
 
 from app.schemas.planning import (
     CandidateModel,
     ClassificationTask,
     PlannerDecision,
+    ExecutionPlan,
     PlanningStatus,
     SplitStrategy,
 )
 
 from app.schemas.run import RunCreateRequest
 
+from app.schemas.project import (
+    DatasetStatus,
+    MLTask,
+    ProjectBlueprint,
+    ProjectStage,
+    FileKind,
+    PlannedFile,
+    InputMode,
+    ProjectDatasetSpec,
+    StreamlitSpec,
+)
 
 logger = get_logger(__name__)
 
@@ -54,6 +58,20 @@ MAX_ANSWER_CHARACTERS = 2000
 MAX_DISCLOSED_CLASS_LABELS = 20
 MAX_DISCLOSED_LABEL_CHARACTERS = 200
 
+
+
+# AUTOAUDIT_BLUEPRINT_V2
+# Small LLM contract. The full file/dependency graph is built and
+# validated in application code, not generated as one huge LLM JSON.
+class _BlueprintIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    task_type: MLTask
+    project_title: str = Field(min_length=3, max_length=100)
+    summary: str = Field(min_length=10, max_length=700)
+    dataset_description: str = Field(min_length=5, max_length=500)
+    prediction_explanation: str = Field(min_length=5, max_length=500)
+    target_column: str | None = Field(default=None, max_length=200)
+    input_mode: InputMode = InputMode.BOTH
 
 # ============================================================
 # ERRORS
@@ -92,6 +110,7 @@ TARGET_NOT_FOUND = {
 # ============================================================
 
 class PlannerAgent:
+
     def __init__(
         self,
         *,
@@ -111,7 +130,6 @@ class PlannerAgent:
         try:
             with path.open("rb") as stream:
                 content = stream.read(MAX_PROMPT_FILE_BYTES + 1)
-
         except OSError:
             raise PlanningContextError(
                 "The Planner prompt file could not be read."
@@ -124,7 +142,6 @@ class PlannerAgent:
 
         try:
             prompt = content.decode("utf-8-sig").strip()
-
         except UnicodeDecodeError:
             raise PlanningContextError(
                 "The Planner prompt must use UTF-8 encoding."
@@ -135,8 +152,6 @@ class PlannerAgent:
                 "The Planner prompt file is empty."
             )
 
-        # Keep the stored objective identical to the request.
-        # Explanations may use the selected response language.
         return (
             prompt
             + "\n\nApplication contract: copy user_objective exactly "
@@ -155,6 +170,7 @@ class PlannerAgent:
         frame: pd.DataFrame,
         user_answers: Sequence[str],
     ) -> None:
+
         if request.dataset_id != profile.dataset_id:
             raise PlanningContextError(
                 "Request and profile refer to different datasets."
@@ -297,13 +313,14 @@ class PlannerAgent:
         frame: pd.DataFrame,
         user_answers: Sequence[str],
     ) -> str:
+
         language = (
             request.language
             or self._settings.default_language
         )
 
-        # Send structural facts, not global numeric statistics
-        # that might be reused as fitted preprocessing values.
+        # Send structural facts rather than fitted statistics.
+
         compact_columns = [
             {
                 "name": column.name,
@@ -326,6 +343,7 @@ class PlannerAgent:
             "user_objective": request.objective,
             "requested_target": request.target_column,
             "response_language": language,
+
             "dataset_profile": {
                 "row_count": profile.row_count,
                 "column_count": profile.column_count,
@@ -333,10 +351,12 @@ class PlannerAgent:
                 "columns": compact_columns,
                 "warnings": compact_warnings,
             },
+
             "target_metadata": self._target_metadata(
                 frame=frame,
                 target=request.target_column,
             ),
+
             "planning_defaults": {
                 "candidate_models": [
                     CandidateModel.LOGISTIC_REGRESSION.value,
@@ -346,6 +366,7 @@ class PlannerAgent:
                 "validation_fraction": self._settings.validation_size,
                 "test_fraction": self._settings.test_size,
             },
+
             "user_answers": list(user_answers),
         }
 
@@ -362,12 +383,10 @@ class PlannerAgent:
                 "Reduce the context or add a bounded summarization step."
             )
 
-        # This character bound limits request growth.
-        # It is not an exact model-token count or fit guarantee.
         return serialized
 
     # ========================================================
-    # GENERATED PLAN VALIDATION
+    # GENERATED EXECUTION PLAN VALIDATION
     # ========================================================
 
     def _validate_decision(
@@ -378,12 +397,12 @@ class PlannerAgent:
         profile: DatasetProfile,
         frame: pd.DataFrame,
     ) -> None:
+
         if decision.status != PlanningStatus.READY:
             if len(decision.clarification_questions) > 3:
                 raise PlanningValidationError(
                     "The Planner returned too many clarification questions."
                 )
-
             return
 
         plan = decision.plan
@@ -395,7 +414,6 @@ class PlannerAgent:
 
         try:
             plan.validate_against_profile(profile)
-
         except ValueError:
             raise PlanningValidationError(
                 "The generated plan is inconsistent with the dataset."
@@ -508,12 +526,10 @@ class PlannerAgent:
                     "The selected time column contains missing values."
                 )
 
-        # These are necessary checks, not complete split feasibility.
-        # Actual partition sizes, chronology, class coverage and
-        # group isolation are verified by the splitting module.
+        # Complete split integrity is verified downstream.
 
     # ========================================================
-    # PUBLIC AGENT METHOD
+    # EXISTING PLAN METHOD
     # ========================================================
 
     async def plan(
@@ -525,13 +541,10 @@ class PlannerAgent:
         user_answers: Sequence[str] = (),
     ) -> PlannerDecision:
         """
-        Generate a plan using the run's configured provider.
+        Generate the existing supported ML execution plan.
 
-        The caller supplies an owner-authorized, integrity-checked
-        frame from DatasetService.
-
-        Domain correctness and feature availability may require
-        human clarification beyond what schemas can prove.
+        The caller must supply an authorized, integrity-checked
+        DataFrame and its matching profile.
         """
 
         self._validate_local_context(
@@ -579,6 +592,18 @@ class PlannerAgent:
             schema=PlannerDecision,
         )
 
+        # AUTOAUDIT_PRESERVE_ORIGINAL_OBJECTIVE
+        # Preserve the exact validated user objective.
+        if (
+            decision.status == PlanningStatus.READY
+            and decision.plan is not None
+            and decision.plan.objective != request.objective
+        ):
+            payload = decision.model_dump(mode="json")
+            payload["plan"]["objective"] = request.objective
+            decision = PlannerDecision.model_validate(payload)
+            logger.info("Restored original Planner objective.")
+
         await asyncio.to_thread(
             self._validate_decision,
             decision=decision,
@@ -593,3 +618,526 @@ class PlannerAgent:
         )
 
         return decision
+
+    # ========================================================
+    # NEW: FULL PROJECT BLUEPRINT
+    # ========================================================
+
+    def _validate_project_context(
+        self,
+        *,
+        goal: str,
+        profile: DatasetProfile | None,
+        requested_target: str | None,
+        user_answers: Sequence[str],
+        language: str,
+    ) -> None:
+
+        if (
+            not isinstance(goal, str)
+            or not (5 <= len(goal.strip()) <= 5000)
+        ):
+            raise PlanningContextError(
+                "Project goal must contain 5-5000 characters."
+            )
+
+        if len(goal) != len(goal.strip()):
+            raise PlanningContextError(
+                "Provide the already-trimmed project goal."
+            )
+
+        if language not in {"en", "mr", "hi"}:
+            raise PlanningContextError(
+                "Unsupported response language."
+            )
+
+        if (
+            profile is not None
+            and not isinstance(profile, DatasetProfile)
+        ):
+            raise PlanningContextError(
+                "profile must be a DatasetProfile or None."
+            )
+
+        if requested_target is not None:
+            if (
+                not isinstance(requested_target, str)
+                or not requested_target.strip()
+            ):
+                raise PlanningContextError(
+                    "requested_target must be a nonblank column."
+                )
+
+            if profile is not None and requested_target not in {
+                column.name
+                for column in profile.columns
+            }:
+                raise PlanningContextError(
+                    "Requested target is not in the dataset."
+                )
+
+        if (
+            isinstance(user_answers, (str, bytes))
+            or not isinstance(user_answers, Sequence)
+        ):
+            raise PlanningContextError(
+                "user_answers must be a sequence."
+            )
+
+        if len(user_answers) > MAX_USER_ANSWERS:
+            raise PlanningContextError(
+                "Too many clarification answers."
+            )
+
+        if any(
+            not isinstance(answer, str)
+            or not answer.strip()
+            or len(answer) > MAX_ANSWER_CHARACTERS
+            for answer in user_answers
+        ):
+            raise PlanningContextError(
+                "Invalid clarification answers."
+            )
+
+    # ========================================================
+    # NEW: BUILD PROJECT PLANNING CONTEXT
+    # ========================================================
+
+    def _build_project_context(
+        self,
+        *,
+        goal: str,
+        profile: DatasetProfile | None,
+        requested_target: str | None,
+        user_answers: Sequence[str],
+        language: str,
+    ) -> str:
+        """
+        Build a bounded project-planning context.
+
+        Only trusted dataset metadata is disclosed.
+        No raw dataset rows or individual feature values.
+        """
+
+        compact_profile = None
+
+        if profile is not None:
+            compact_profile = {
+                "row_count": profile.row_count,
+                "column_count": profile.column_count,
+
+                "columns": [
+                    {
+                        "name": column.name,
+                        "kind": column.kind.value,
+                        "missing_count": column.missing_count,
+                        "unique_count": column.unique_count,
+                    }
+                    for column in profile.columns
+                ],
+
+                "warnings": [
+                    {
+                        "code": warning.code.value,
+                        "columns": warning.columns,
+                    }
+                    for warning in profile.warnings
+                ],
+            }
+
+        context = {
+            "mode": "project_blueprint",
+            "user_objective": goal,
+            "requested_target": requested_target,
+            "response_language": language,
+            "dataset_available": profile is not None,
+            "dataset_profile": compact_profile,
+            "user_answers": list(user_answers),
+
+            "project_capabilities": {
+                "blueprint_task_types": [
+                    task.value for task in MLTask
+                ],
+
+                "currently_implemented_training_tasks": [
+                    MLTask.BINARY_CLASSIFICATION.value,
+                    MLTask.MULTICLASS_CLASSIFICATION.value,
+                ],
+
+                "target_app_framework": "streamlit",
+                "human_approval_required": True,
+
+                "first_three_agents": [
+                    ProjectStage.PLANNER.value,
+                    ProjectStage.DATA_ENGINEERING.value,
+                    ProjectStage.MODEL_TRAINING.value,
+                ],
+
+                "final_packaging_after_all_agents": True,
+            },
+        }
+
+        payload = json.dumps(
+            context,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+
+        if len(payload) > MAX_CONTEXT_CHARACTERS:
+            raise PlanningContextError(
+                "Project planning context is too large."
+            )
+
+        return payload
+
+    # ========================================================
+    # NEW: VALIDATE PROJECT BLUEPRINT
+    # ========================================================
+
+    def _validate_project_blueprint(
+        self,
+        *,
+        blueprint: ProjectBlueprint,
+        goal: str,
+        profile: DatasetProfile | None,
+        requested_target: str | None,
+    ) -> None:
+        """
+        Check the LLM blueprint against trusted dataset facts
+        and the ownership rules of the full team workflow.
+        """
+
+        if blueprint.goal != goal:
+            raise PlanningValidationError(
+                "The Planner changed the original goal."
+            )
+
+        if blueprint.revision != 1:
+            raise PlanningValidationError(
+                "A first project blueprint must be revision 1."
+            )
+
+        expected_availability = (
+            DatasetStatus.AVAILABLE
+            if profile is not None
+            else DatasetStatus.REQUIRED
+        )
+
+        if blueprint.dataset.status != expected_availability:
+            raise PlanningValidationError(
+                "Dataset availability was misrepresented."
+            )
+
+        if (
+            requested_target is not None
+            and blueprint.dataset.target_column != requested_target
+        ):
+            raise PlanningValidationError(
+                "The user-selected target was changed."
+            )
+
+        if profile is None:
+            if (
+                blueprint.dataset.target_column is not None
+                and requested_target is None
+            ):
+                raise PlanningValidationError(
+                    "Without a dataset, the Planner "
+                    "cannot invent a target column."
+                )
+
+            if blueprint.dataset.expected_feature_columns:
+                raise PlanningValidationError(
+                    "Without a dataset profile, "
+                    "feature column names are unverified."
+                )
+
+        else:
+            known = {
+                column.name
+                for column in profile.columns
+            }
+
+            if (
+                blueprint.dataset.target_column is not None
+                and blueprint.dataset.target_column not in known
+            ):
+                raise PlanningValidationError(
+                    "Blueprint target not in dataset."
+                )
+
+            if not set(
+                blueprint.dataset.expected_feature_columns
+            ).issubset(known):
+                raise PlanningValidationError(
+                    "Blueprint references unknown columns."
+                )
+
+        files = {
+            entry.path.casefold(): entry
+            for entry in blueprint.files
+        }
+
+        if (
+            files["app.py"].producer
+            != ProjectStage.MODEL_TRAINING
+        ):
+            raise PlanningValidationError(
+                "The Model Training stage must "
+                "generate the Streamlit app.py."
+            )
+
+        for filename in (
+            "requirements.txt",
+            "README.md",
+        ):
+            if (
+                files[filename.casefold()].producer
+                != ProjectStage.DOCUMENTATION
+            ):
+                raise PlanningValidationError(
+                    f"Documentation stage must produce {filename}."
+                )
+
+        if not any(
+            entry.path.endswith(".py")
+            and entry.producer == ProjectStage.DATA_ENGINEERING
+            for entry in blueprint.files
+        ):
+            raise PlanningValidationError(
+                "At least one Data Engineering "
+                "Python source file is required."
+            )
+
+        if not any(
+            entry.path.endswith(".py")
+            and entry.producer == ProjectStage.MODEL_TRAINING
+            for entry in blueprint.files
+        ):
+            raise PlanningValidationError(
+                "At least one Model Training "
+                "Python source file is required."
+            )
+
+        # Regression can be described in the blueprint,
+        # but is not yet implemented in the current executor.
+
+        if (
+            blueprint.task_type == MLTask.REGRESSION
+            and not any(
+                "regression" in assumption.casefold()
+                and (
+                    "not" in assumption.casefold()
+                    or "requires" in assumption.casefold()
+                )
+                for assumption in blueprint.assumptions
+            )
+        ):
+            raise PlanningValidationError(
+                "A regression blueprint must disclose "
+                "current training limitations."
+            )
+
+    # ========================================================
+    # NEW: PUBLIC PROJECT PLANNING METHOD
+    # ========================================================
+
+    # AUTOAUDIT_BLUEPRINT_V2
+    @staticmethod
+    def _project_files() -> list[PlannedFile]:
+        """Supported, versioned interfaces for a runnable Streamlit project.
+
+        The Planner decides which template is appropriate; later agents
+        create the files, run tests and package only verified outputs.
+        """
+        specs = [
+            ("preprocessing.py", "python", "data_engineering",
+             "Implement approved feature casting, imputation, scaling and encoding; fit on train partition only.", []),
+            ("reports/execution_plan.json", "report", "data_engineering",
+             "Preserve the validated ML execution plan exactly.", []),
+            ("reports/cleaning_proposal.json", "report", "data_engineering",
+             "Preserve the human-approved feature cleaning policies.", []),
+            ("data/sample_input.csv", "data", "data_engineering",
+             "A header-only prediction-input template using approved features; never fabricated training data.", []),
+            ("models/model.joblib", "model", "model_training",
+             "Copy the real trained model artifact, including its fitted preprocessing pipeline.", []),
+            ("reports/results.json", "report", "model_training",
+             "Real training and validation metrics; not final test results.", []),
+            ("reports/splits.json", "report", "model_training",
+             "Preserve row partition identifiers without re-fitting on test data.", []),
+            ("reports/environment.json", "report", "model_training",
+             "Record exact training runtime and package versions.", []),
+            ("reports/approval.json", "report", "model_training",
+             "Record revision-matched human cleaning approval.", []),
+            ("reports/input_schema.json", "report", "model_training",
+             "Define the prediction input columns and target without leakage.", []),
+            ("predict.py", "python", "model_training",
+             "Load the verified fitted model and safely predict from approved input schema without training at request time.",
+             ["preprocessing.py", "models/model.joblib", "reports/input_schema.json"]),
+            ("app.py", "python", "model_training",
+             "Streamlit inference interface using predict.py for validated manual and CSV inputs.",
+             ["predict.py", "reports/input_schema.json"]),
+            ("reports/leakage_checks.json", "report", "leakage_refactoring",
+             "Record leakage findings and approved repairs before tests.",
+             ["reports/execution_plan.json", "reports/cleaning_proposal.json", "models/model.joblib"]),
+            ("tests/test_prediction.py", "test", "testing",
+             "Exercise loading and inference inputs, missing columns, and representative prediction behavior.",
+             ["app.py", "predict.py", "reports/input_schema.json"]),
+            ("reports/test_results.json", "report", "testing",
+             "Store actual test execution outcomes; do not invent passing checks.",
+             ["tests/test_prediction.py"]),
+            ("reports/verification.json", "report", "verification",
+             "Record runnable-project verification evidence and blocker resolution.",
+             ["reports/test_results.json"]),
+            ("requirements.txt", "documentation", "documentation",
+             "List pinned, compatible runtime dependencies for the standalone generated app.",
+             ["app.py"]),
+            ("README.md", "documentation", "documentation",
+             "Describe extraction, installation, launching Streamlit, inference examples and known limitations.",
+             ["requirements.txt", "reports/verification.json"]),
+            ("reports/package_validation.json", "report", "packaging",
+             "Record packaging integrity and runnable ZIP verification before delivery.",
+             ["README.md", "reports/verification.json"]),
+        ]
+        return [
+            PlannedFile(path=path, kind=FileKind(kind), producer=ProjectStage(stage),
+                        purpose=purpose, depends_on=dependencies, required=True)
+            for path, kind, stage, purpose, dependencies in specs
+        ]
+
+    @staticmethod
+    def _safe_project_slug(value: str) -> str:
+        name = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")[:55]
+        if not name or not name[0].isalpha():
+            name = "autoaudit_" + name
+        return (name[:64] if len(name) >= 3 else "autoaudit_project")
+
+    async def plan_project(
+        self, *, goal: str, profile: DatasetProfile | None = None,
+        requested_target: str | None = None,
+        user_answers: Sequence[str] = (), language: str | None = None,
+        execution_plan: ExecutionPlan | None = None,
+    ) -> ProjectBlueprint:
+        """Return a schema-validated project-wide file plan, no generated code.
+
+        Dataset-backed LangGraph planning reuses the already approved/validated
+        ExecutionPlan and never makes a second large Ollama blueprint call.
+        Goal-only planning asks Ollama for a small intent schema instead.
+        """
+        chosen_language = language or self._settings.default_language
+        self._validate_project_context(
+            goal=goal, profile=profile, requested_target=requested_target,
+            user_answers=user_answers, language=chosen_language,
+        )
+
+        if execution_plan is not None:
+            if profile is None:
+                raise PlanningContextError("An execution plan needs its dataset profile.")
+            plan = ExecutionPlan.model_validate(execution_plan)
+            plan.validate_against_profile(profile)
+            if requested_target is not None and plan.target_column != requested_target:
+                raise PlanningValidationError("Execution plan target differs from selected target.")
+            target = plan.target_column
+            task = MLTask(plan.task_type.value)
+            excluded = {e.column for e in plan.feature_exclusions}
+            feature_names = [c.name for c in profile.columns
+                             if c.name != target and c.name not in excluded]
+            title = f"{target} Predictor"[:120]
+            summary = (
+                f"Train and evaluate a {task.value} project predicting {target}; "
+                f"use {plan.primary_metric.value if hasattr(plan.primary_metric, 'value') else plan.primary_metric} "
+                "for validation, review preprocessing before training, and hold out test data for audit."
+            )
+            description = f"Uploaded CSV: {profile.row_count} rows and {profile.column_count} columns."
+            explanation = "Predictions use approved input features and the trained pipeline; validation is not a final test or audit."
+            mode = InputMode.BOTH
+        else:
+            # Keep the LLM request small: the prompt and schema together are
+            # a fraction of the original complete ProjectBlueprint output.
+            context = self._build_project_context(
+                goal=goal, profile=profile, requested_target=requested_target,
+                user_answers=user_answers, language=chosen_language,
+            )
+            prompt = (
+                "You are the AutoAudit project intent Planner. "
+                "Return only the compact structured intent, not files/code. "
+                "Determine whether the user wants binary_classification, "
+                "multiclass_classification or regression. "
+                "If a dataset is absent, target_column MUST be null unless "
+                "requested_target is explicitly provided. "
+                "If a dataset is present, use exact existing column spelling. "
+                "A dataset is required to train, but is optional to plan. "
+                "Never invent columns, metrics, model scores or project files."
+            )
+            intent = await self._provider.generate_structured(
+                system_prompt=prompt, user_prompt=context,
+                schema=_BlueprintIntent,
+            )
+            if not isinstance(intent, _BlueprintIntent):
+                intent = _BlueprintIntent.model_validate(intent)
+            task = intent.task_type
+            title = intent.project_title
+            summary = intent.summary
+            description = intent.dataset_description
+            explanation = intent.prediction_explanation
+            mode = intent.input_mode
+            if requested_target is not None:
+                target = requested_target
+            elif profile is not None and intent.target_column in {
+                c.name for c in profile.columns
+            }:
+                target = intent.target_column
+            else:
+                target = None
+            # These are hypotheses until dataset-backed ML Planner performs
+            # explicit feature exclusion and leakage validation.
+            feature_names = []
+
+        assumptions = [
+            "All generated source code and trained artifacts require testing, verification and packaging before delivery.",
+            "Final test split is reserved for independent audit, not selection.",
+        ]
+        if task == MLTask.REGRESSION:
+            assumptions.append(
+                "Regression training requires implementation; the current executor does not support regression."
+            )
+        if profile is None:
+            assumptions.append("Dataset must be uploaded and profiled before preprocessing or model training.")
+
+        blueprint = ProjectBlueprint(
+            project_slug=self._safe_project_slug(title),
+            goal=goal,
+            summary=summary,
+            task_type=task,
+            dataset=ProjectDatasetSpec(
+                status=(DatasetStatus.AVAILABLE if profile is not None
+                        else DatasetStatus.REQUIRED),
+                description=description,
+                target_column=target,
+                expected_feature_columns=feature_names,
+                source_notes=(
+                    "Use verified uploaded dataset metadata; final features come from the validated ExecutionPlan and approved CleaningProposal."
+                    if profile is not None else
+                    "No dataset yet. Confirm columns and target after upload; do not fabricate training data."
+                ),
+            ),
+            streamlit=StreamlitSpec(
+                title=title,
+                description=goal[:1500],
+                input_mode=mode,
+                show_metrics=True,
+                show_probabilities=False,
+                prediction_explanation=explanation,
+            ),
+            files=self._project_files(),
+            assumptions=assumptions,
+            cleaning_approval_required=True,
+        )
+        self._validate_project_blueprint(
+            blueprint=blueprint, goal=goal, profile=profile,
+            requested_target=requested_target,
+        )
+        logger.info("Planner blueprint ready: task=%s, files=%d.",
+                    task.value, len(blueprint.files))
+        return blueprint

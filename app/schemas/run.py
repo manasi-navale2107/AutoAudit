@@ -1,17 +1,20 @@
+
+"""Validated request and response contracts for AutoAudit runs.
+
+The existing dataset-backed RunCreateRequest and RunResponse remain
+compatible with the first-three-agent workflow.
+
+Separate goal-only project planning contracts allow the Planner to
+design a complete project without pretending that a dataset,
+trained model, generated source files, or ZIP already exists.
+
+These are data contracts, not route implementations or authorization
+checks.
 """
-Run contracts for AutoAudit's first-three-agent workflow.
 
-Responsibilities:
-- Validate new-run requests.
-- Represent server-resolved LLM configuration.
-- Describe workflow progress and review checkpoints.
-- Return safe, structured run-status responses.
+from __future__ import annotations
 
-These schemas do not start background work, authorize users,
-enforce state transitions, or make provider API calls.
-
-The run service must enforce those responsibilities.
-"""
+import re
 
 from datetime import datetime, timezone
 from enum import Enum
@@ -28,13 +31,20 @@ from pydantic import (
 
 from app.schemas.planning import ExecutionPlan
 
+from app.schemas.project import (
+    DatasetStatus,
+    ProjectBlueprint,
+    ProjectStage,
+    validate_relative_path,
+)
+
 
 # ============================================================
-# SHARED BASE
+# SHARED BASE SCHEMA
 # ============================================================
 
 class RunSchema(BaseModel):
-    """Reject unexpected fields and invalid numeric values."""
+    """Reject unknown fields rather than silently ignoring inputs."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -45,13 +55,17 @@ class RunSchema(BaseModel):
 
 
 # ============================================================
-# SUPPORTED VALUES
+# PROVIDER
 # ============================================================
 
 class ProviderName(str, Enum):
     GROQ = "groq"
     OLLAMA = "ollama"
 
+
+# ============================================================
+# EXISTING RUN STATUSES
+# ============================================================
 
 class RunStatus(str, Enum):
     QUEUED = "queued"
@@ -69,6 +83,10 @@ class RunStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+
+# ============================================================
+# RUN ERROR CODES
+# ============================================================
 
 class RunErrorCode(str, Enum):
     DATASET_UNAVAILABLE = "dataset_unavailable"
@@ -89,30 +107,17 @@ LanguageCode = Literal["en", "mr", "hi"]
 
 
 # ============================================================
-# NEW RUN REQUEST
+# EXISTING DATASET-BACKED RUN REQUEST
 # ============================================================
 
 class RunCreateRequest(RunSchema):
     """
-    User request to start a workflow.
+    Original dataset-backed run request.
 
-    request_id:
-        Idempotency identifier. Reuse the same UUID when retrying
-        the same submission.
+    The current RunService.start() loads dataset_id before planning.
 
-    target_column:
-        Optional user-specified target. Preserve its exact name.
-        When omitted, the Planner may ask for clarification.
-
-    provider:
-        Optional provider override. Otherwise use server defaults.
-
-    model:
-        Optional model selection for the explicitly chosen provider.
-        The backend must check its allowlist and availability.
-
-    This request deliberately excludes API keys, server URLs,
-    filesystem paths, raw Python code and ownership fields.
+    This request still requires a dataset so existing training runs
+    cannot accidentally start without real training data.
     """
 
     request_id: UUID
@@ -145,6 +150,7 @@ class RunCreateRequest(RunSchema):
         cls,
         value: str | None,
     ) -> str | None:
+
         if value is None:
             return None
 
@@ -163,25 +169,106 @@ class RunCreateRequest(RunSchema):
         cls,
         value: str | None,
     ) -> str | None:
+
         if value is not None and not value.strip():
             raise ValueError(
                 "Use null when the target is not specified."
             )
 
-        # Do not strip: match the original dataset column exactly.
+        # Preserve the exact dataset column spelling.
         return value
 
     @model_validator(mode="after")
     def validate_provider_selection(self) -> Self:
+
         if self.model is not None and self.provider is None:
             raise ValueError(
                 "Select a provider when specifying a model."
             )
 
-        if len(self.objective) < 5:
+        return self
+
+
+# ============================================================
+# NEW: GOAL-ONLY PROJECT PLANNING REQUEST
+# ============================================================
+
+class ProjectPlanningRequest(RunSchema):
+    """
+    Goal-only or dataset-assisted project-blueprint request.
+
+    A dataset is OPTIONAL for planning.
+
+    A dataset is NOT optional for actual fitted-model training.
+
+    RunService and API routes must separately implement support
+    for this request.
+    """
+
+    request_id: UUID
+
+    objective: str = Field(
+        min_length=5,
+        max_length=5000,
+    )
+
+    dataset_id: UUID | None = None
+
+    target_column: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
+
+    language: LanguageCode | None = None
+
+    provider: ProviderName | None = None
+
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
+
+    @field_validator("objective", "model")
+    @classmethod
+    def trim_text(
+        cls,
+        value: str | None,
+    ) -> str | None:
+
+        if value is None:
+            return None
+
+        value = value.strip()
+
+        if not value:
             raise ValueError(
-                "Provide an objective with at least "
-                "five non-padding characters."
+                "Text must not be blank."
+            )
+
+        return value
+
+    @field_validator("target_column")
+    @classmethod
+    def keep_exact_target(
+        cls,
+        value: str | None,
+    ) -> str | None:
+
+        if value is not None and not value.strip():
+            raise ValueError(
+                "Use null for an unknown target column."
+            )
+
+        return value
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> Self:
+
+        if self.model is not None and self.provider is None:
+            raise ValueError(
+                "Select a provider when specifying a model."
             )
 
         return self
@@ -193,12 +280,9 @@ class RunCreateRequest(RunSchema):
 
 class RunLLMConfiguration(RunSchema):
     """
-    Non-secret LLM settings fixed for this run.
+    Immutable, server-resolved, nonsecret LLM configuration.
 
-    The server resolves defaults before creating this object.
-    Provider-specific capabilities require additional checks.
-
-    A provider/model change applies to a new run.
+    Never expose API keys through this schema.
     """
 
     model_config = ConfigDict(
@@ -238,7 +322,6 @@ class RunLLMConfiguration(RunSchema):
         le=5,
     )
 
-    # Required key; null for Groq.
     ollama_num_ctx: int | None = Field(
         strict=True,
         ge=1024,
@@ -247,46 +330,47 @@ class RunLLMConfiguration(RunSchema):
 
     @field_validator("model")
     @classmethod
-    def validate_model_name(cls, value: str) -> str:
+    def validate_model_name(
+        cls,
+        value: str,
+    ) -> str:
+
         value = value.strip()
 
         if not value:
             raise ValueError(
-                "The resolved model ID must not be blank."
+                "Resolved model ID must not be blank."
             )
 
         return value
 
     @model_validator(mode="after")
     def validate_provider_options(self) -> Self:
+
         if self.provider == ProviderName.OLLAMA:
+
             if self.ollama_num_ctx is None:
                 raise ValueError(
-                    "Ollama requires an explicit context limit."
+                    "Ollama requires a context limit."
                 )
 
         elif self.ollama_num_ctx is not None:
             raise ValueError(
-                "Groq configuration must use null "
-                "for ollama_num_ctx."
+                "Groq must use null for ollama_num_ctx."
             )
 
         return self
 
 
 # ============================================================
-# PUBLIC ERROR DETAILS
+# PUBLIC RUN ERROR
 # ============================================================
 
 class RunError(RunSchema):
     """
-    Safe error information for the interface.
+    Public-safe error details.
 
-    message must be composed by the application.
-    Do not copy raw provider responses, exception messages,
-    stack traces, credentials or internal paths into it.
-
-    retryable is guidance, not authorization to replay work.
+    Never copy credentials, raw tracebacks or internal paths here.
     """
 
     code: RunErrorCode
@@ -302,7 +386,11 @@ class RunError(RunSchema):
 
     @field_validator("message")
     @classmethod
-    def reject_blank_message(cls, value: str) -> str:
+    def reject_blank_message(
+        cls,
+        value: str,
+    ) -> str:
+
         value = value.strip()
 
         if not value:
@@ -314,14 +402,12 @@ class RunError(RunSchema):
 
 
 # ============================================================
-# PENDING CLEANING REVIEW
+# EXISTING HUMAN REVIEW REFERENCE
 # ============================================================
 
 class PendingReviewReference(RunSchema):
     """
     Reference to the exact cleaning plan awaiting user review.
-
-    The review endpoint uses these values to detect stale approval.
     """
 
     plan_id: UUID
@@ -338,20 +424,14 @@ class PendingReviewReference(RunSchema):
 
 
 # ============================================================
-# RUN STATUS RESPONSE
+# EXISTING RUN RESPONSE
 # ============================================================
 
 class RunResponse(RunSchema):
     """
-    Public snapshot of a workflow run.
+    Public snapshot of a dataset-backed workflow run.
 
-    The backend assigns IDs, timestamps, state_version and status.
-
-    state_version supports optimistic concurrency in storage.
-    This schema alone does not enforce atomic state updates.
-
-    progress_message describes the current stage.
-    It is not a fabricated percentage estimate.
+    Existing Human-in-the-Loop validation is preserved.
     """
 
     run_id: UUID
@@ -395,7 +475,6 @@ class RunResponse(RunSchema):
 
     error: RunError | None = None
 
-    # Server-generated artifact reference, not a filesystem path.
     handoff_artifact_id: UUID | None = None
 
     created_at: datetime
@@ -404,7 +483,11 @@ class RunResponse(RunSchema):
 
     @field_validator("objective", "progress_message")
     @classmethod
-    def reject_blank_text(cls, value: str) -> str:
+    def reject_blank_text(
+        cls,
+        value: str,
+    ) -> str:
+
         if not value.strip():
             raise ValueError(
                 "Text fields must not be blank."
@@ -418,7 +501,11 @@ class RunResponse(RunSchema):
         cls,
         values: list[str],
     ) -> list[str]:
-        if any(not value.strip() for value in values):
+
+        if any(
+            not question.strip()
+            for question in values
+        ):
             raise ValueError(
                 "Clarification questions must not be blank."
             )
@@ -431,15 +518,17 @@ class RunResponse(RunSchema):
         cls,
         value: datetime,
     ) -> datetime:
+
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(
-                "Run timestamps must include timezone information."
+                "Run timestamps must include a timezone."
             )
 
         return value.astimezone(timezone.utc)
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
+
         if self.updated_at < self.created_at:
             raise ValueError(
                 "updated_at must not precede created_at."
@@ -450,11 +539,11 @@ class RunResponse(RunSchema):
             != (self.execution_plan_revision is None)
         ):
             raise ValueError(
-                "Execution plan and revision must be "
-                "present together."
+                "Execution plan and revision must appear together."
             )
 
         if self.status == RunStatus.AWAITING_CLARIFICATION:
+
             if not self.clarification_questions:
                 raise ValueError(
                     "Awaiting clarification requires questions."
@@ -462,19 +551,17 @@ class RunResponse(RunSchema):
 
         elif self.clarification_questions:
             raise ValueError(
-                "Active clarification questions require "
-                "awaiting_clarification status."
+                "Questions require awaiting_clarification status."
             )
 
         if self.status == RunStatus.AWAITING_REVIEW:
-            if self.pending_review is None:
-                raise ValueError(
-                    "Awaiting review requires a plan reference."
-                )
 
-            if self.execution_plan is None:
+            if (
+                self.pending_review is None
+                or self.execution_plan is None
+            ):
                 raise ValueError(
-                    "Cleaning review requires an execution plan."
+                    "Cleaning review requires plan and review reference."
                 )
 
             if (
@@ -482,17 +569,16 @@ class RunResponse(RunSchema):
                 != self.execution_plan_revision
             ):
                 raise ValueError(
-                    "Pending review must match the current "
-                    "execution-plan revision."
+                    "Review must reference current execution plan."
                 )
 
         elif self.pending_review is not None:
             raise ValueError(
-                "A pending review reference requires "
-                "awaiting_review status."
+                "Pending review requires awaiting_review status."
             )
 
         if self.status == RunStatus.FAILED:
+
             if self.error is None:
                 raise ValueError(
                     "Failed runs require safe error details."
@@ -500,10 +586,10 @@ class RunResponse(RunSchema):
 
         elif self.error is not None:
             raise ValueError(
-                "Active error details require failed status."
+                "Error details require failed status."
             )
 
-        statuses_requiring_plan = {
+        stages_requiring_plan = {
             RunStatus.PROPOSING_CLEANING,
             RunStatus.AWAITING_REVIEW,
             RunStatus.REVISING_CLEANING,
@@ -513,24 +599,340 @@ class RunResponse(RunSchema):
         }
 
         if (
-            self.status in statuses_requiring_plan
+            self.status in stages_requiring_plan
             and self.execution_plan is None
         ):
             raise ValueError(
-                "This workflow stage requires an execution plan."
+                "This stage requires an execution plan."
             )
 
         if self.status == RunStatus.READY_FOR_AUDIT:
+
             if self.handoff_artifact_id is None:
                 raise ValueError(
-                    "Ready-for-audit runs require "
-                    "a handoff artifact reference."
+                    "Ready-for-audit requires an artifact reference."
                 )
 
         elif self.handoff_artifact_id is not None:
             raise ValueError(
-                "The handoff reference is exposed only "
-                "when the run is ready for audit."
+                "Handoff reference is only for ready-for-audit runs."
+            )
+
+        return self
+
+
+# ============================================================
+# NEW: PROJECT PLANNING STATUSES
+# ============================================================
+
+class ProjectPlanningStatus(str, Enum):
+
+    PLANNING = "planning"
+
+    PLANNED = "planned"
+
+    AWAITING_DATASET = "awaiting_dataset"
+
+    NEEDS_CLARIFICATION = "needs_clarification"
+
+    UNSUPPORTED = "unsupported"
+
+    FAILED = "failed"
+
+
+# ============================================================
+# NEW: PROJECT PLANNING RESPONSE
+# ============================================================
+
+class ProjectPlanningResponse(RunSchema):
+    """
+    Response for goal-only or dataset-assisted project planning.
+
+    A blueprint is NOT a trained model or completed ZIP.
+    """
+
+    run_id: UUID
+
+    objective: str = Field(
+        min_length=5,
+        max_length=5000,
+    )
+
+    dataset_id: UUID | None = None
+
+    status: ProjectPlanningStatus
+
+    language: LanguageCode
+
+    blueprint: ProjectBlueprint | None = None
+
+    clarification_questions: list[str] = Field(
+        default_factory=list,
+        max_length=3,
+    )
+
+    error: RunError | None = None
+
+    final_zip_ready: Literal[False] = False
+
+    @field_validator("objective")
+    @classmethod
+    def ensure_goal(
+        cls,
+        value: str,
+    ) -> str:
+
+        if not value.strip():
+            raise ValueError(
+                "Project objective must not be blank."
+            )
+
+        return value
+
+    @field_validator("clarification_questions")
+    @classmethod
+    def ensure_questions(
+        cls,
+        questions: list[str],
+    ) -> list[str]:
+
+        if any(
+            not question.strip()
+            for question in questions
+        ):
+            raise ValueError(
+                "Clarification questions must be nonblank."
+            )
+
+        return questions
+
+    @model_validator(mode="after")
+    def check_project_state(self) -> Self:
+
+        has_plan = self.status in {
+            ProjectPlanningStatus.PLANNED,
+            ProjectPlanningStatus.AWAITING_DATASET,
+        }
+
+        if has_plan != (self.blueprint is not None):
+            raise ValueError(
+                "A planned state must include a blueprint."
+            )
+
+        if self.blueprint is not None:
+
+            if self.blueprint.goal != self.objective:
+                raise ValueError(
+                    "Blueprint goal differs from user objective."
+                )
+
+            expected_dataset_status = (
+                DatasetStatus.AVAILABLE
+                if self.dataset_id is not None
+                else DatasetStatus.REQUIRED
+            )
+
+            if (
+                self.blueprint.dataset.status
+                != expected_dataset_status
+            ):
+                raise ValueError(
+                    "Blueprint dataset status differs from request."
+                )
+
+            if (
+                self.status == ProjectPlanningStatus.AWAITING_DATASET
+                and self.dataset_id is not None
+            ):
+                raise ValueError(
+                    "Awaiting dataset cannot report an attached dataset."
+                )
+
+            if (
+                self.status == ProjectPlanningStatus.PLANNED
+                and self.dataset_id is None
+            ):
+                raise ValueError(
+                    "Without dataset, status must be awaiting_dataset."
+                )
+
+        if self.status == ProjectPlanningStatus.NEEDS_CLARIFICATION:
+
+            if not self.clarification_questions:
+                raise ValueError(
+                    "Clarification status requires questions."
+                )
+
+        elif self.clarification_questions:
+            raise ValueError(
+                "Questions require needs_clarification status."
+            )
+
+        if self.status == ProjectPlanningStatus.FAILED:
+
+            if self.error is None:
+                raise ValueError(
+                    "Failed planning requires safe error details."
+                )
+
+        elif self.error is not None:
+            raise ValueError(
+                "Error details require failed status."
+            )
+
+        return self
+
+
+# ============================================================
+# NEW: INDIVIDUAL PROJECT FILE PROGRESS
+# ============================================================
+
+class ProjectFileProgress(RunSchema):
+    """
+    Tracks one planned or physically generated project file.
+
+    A file cannot be marked generated without a recorded checksum.
+    """
+
+    path: str
+
+    producer: ProjectStage
+
+    status: Literal[
+        "planned",
+        "created",
+        "revised",
+    ]
+
+    revision: int = Field(
+        strict=True,
+        ge=0,
+    )
+
+    sha256: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def check_path(
+        cls,
+        value: str,
+    ) -> str:
+
+        return validate_relative_path(value)
+
+    @field_validator("sha256")
+    @classmethod
+    def check_hash(
+        cls,
+        value: str | None,
+    ) -> str | None:
+
+        if (
+            value is not None
+            and not re.fullmatch(r"[0-9a-f]{64}", value)
+        ):
+            raise ValueError(
+                "SHA-256 must be 64 lowercase hex characters."
+            )
+
+        return value
+
+    @model_validator(mode="after")
+    def check_file_state(self) -> Self:
+
+        if self.status == "planned":
+
+            if (
+                self.revision != 0
+                or self.sha256 is not None
+            ):
+                raise ValueError(
+                    "Planned files must have revision 0 and no hash."
+                )
+
+        else:
+
+            if (
+                self.revision < 1
+                or self.sha256 is None
+            ):
+                raise ValueError(
+                    "Generated files require revision and checksum."
+                )
+
+        return self
+
+
+# ============================================================
+# NEW: PROJECT WORKSPACE PROGRESS RESPONSE
+# ============================================================
+
+class ProjectProgressResponse(RunSchema):
+    """
+    Read-only project generation progress.
+
+    This contract covers the initial project-building workflow,
+    not the final Packaging Agent.
+    """
+
+    run_id: UUID
+
+    planned: bool
+
+    project_slug: str | None = None
+
+    blueprint_revision: int | None = Field(
+        default=None,
+        ge=1,
+    )
+
+    files: list[ProjectFileProgress] = Field(
+        default_factory=list,
+    )
+
+    stage_status: dict[str, str] = Field(
+        default_factory=dict,
+    )
+
+    final_zip_ready: bool = False
+
+    @model_validator(mode="after")
+    def check_progress(self) -> Self:
+
+        if self.planned != (self.project_slug is not None):
+            raise ValueError(
+                "A planned workspace requires its project slug."
+            )
+
+        if self.planned != (self.blueprint_revision is not None):
+            raise ValueError(
+                "Blueprint revision must match planned state."
+            )
+
+        if not self.planned:
+
+            if (
+                self.files
+                or self.stage_status
+                or self.final_zip_ready
+            ):
+                raise ValueError(
+                    "Unplanned projects cannot have generated files or ZIPs."
+                )
+
+        if self.final_zip_ready:
+            raise ValueError(
+                "Only the later Packaging Agent can enable ZIP delivery."
+            )
+
+        file_paths = {
+            item.path.casefold()
+            for item in self.files
+        }
+
+        if len(file_paths) != len(self.files):
+            raise ValueError(
+                "Duplicate project file progress paths."
             )
 
         return self

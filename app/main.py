@@ -1,215 +1,613 @@
+
+"""AutoAudit FastAPI application entry point.
+
+Serves the existing browser workspace, dataset endpoints, the
+first-three-agent LangGraph workflow, and the new goal-only
+project blueprint router.
+
+The final standalone-project ZIP belongs to the later
+Packaging Agent, after all other required agents finish.
+"""
+
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator
+
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes.datasets import router as datasets_router
-from app.api.routes.runs import router as runs_router
+from pydantic import ValidationError
+
+from app.api.routes.project_planning import (
+    router as project_planning_router,
+)
+
 from app.core.config import get_settings
-from app.core.logging_config import configure_logging
-from app.services.dataset_service import DatasetService
-from app.services.run_service import RunService
+
+from app.graph.workflow import ReviewDecision
+
+from app.schemas.run import RunCreateRequest
+
+from app.services.dataset_service import (
+    DatasetIntegrityError,
+    DatasetService,
+)
+
+from app.services.run_service import (
+    RunConflictError,
+    RunService,
+)
+
+from app.services.project_workspace_service import (
+    WorkspaceIntegrityError,
+)
 
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_RUNTIME_DIR = PROJECT_ROOT / "runtime"
-DEFAULT_FRONTEND_DIR = PROJECT_ROOT / "frontend"
+settings = get_settings()
+
+MAX_UPLOAD_BYTES = min(
+    settings.max_upload_mb * 1024 * 1024,
+    25 * 1024 * 1024,
+)
 
 
-def create_app(
-    *,
-    runtime_dir: str | Path = DEFAULT_RUNTIME_DIR,
-    frontend_dir: str | Path = DEFAULT_FRONTEND_DIR,
-) -> FastAPI:
-    """Build the API. Services open only when the server starts."""
-    runtime_root = Path(runtime_dir).expanduser().resolve()
-    frontend_root = Path(frontend_dir).expanduser().resolve()
+# ============================================================
+# APPLICATION LIFESPAN
+# ============================================================
 
-    @asynccontextmanager
-    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        configure_logging()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize services and close them on application shutdown."""
 
-        application.state.ready = False
-        application.state.dataset_service = None
-        application.state.run_service = None
+    settings.create_runtime_directories()
+
+    dataset_service = DatasetService(
+        root_dir=settings.uploads_dir
+    )
+
+    run_service = RunService(
+        dataset_loader=dataset_service.load_bytes,
+        root_dir=settings.runtime_dir,
+        training_timeout_seconds=(
+            settings.training_timeout_seconds
+        ),
+        max_active_runs=settings.max_concurrent_runs,
+        max_pending_runs=max(
+            8,
+            settings.max_concurrent_runs,
+        ),
+        max_revisions=settings.max_plan_revisions,
+        enable_project_blueprint=False,
+    )
+
+    async with run_service:
+
+        app.state.dataset_service = dataset_service
+        app.state.run_service = run_service
 
         try:
-            # Validate settings without making a paid LLM request.
-            # RunService validates the selected provider when a run starts.
-            get_settings()
+            yield
 
-            datasets = DatasetService(
-                root_dir=runtime_root / "uploads",
-            )
-
-            async with RunService(
-                dataset_loader=datasets.load_bytes,
-                root_dir=runtime_root,
-            ) as runs:
-                application.state.dataset_service = datasets
-                application.state.run_service = runs
-                application.state.ready = True
-
-                logger.info("AutoAudit application started.")
-
-                try:
-                    yield
-                finally:
-                    application.state.ready = False
-                    logger.info("AutoAudit application stopping.")
-
-                    # RunService.__aexit__ stops its tasks and training
-                    # process, then closes databases and releases its lock.
         finally:
-            application.state.ready = False
-            application.state.run_service = None
-            application.state.dataset_service = None
+            app.state.run_service = None
+            app.state.dataset_service = None
 
-    application = FastAPI(
-        title="AutoAudit API",
-        version="0.1.0",
-        description=(
-            "Dataset upload, planning, human-reviewed preprocessing, "
-            "and model training."
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title=settings.app_name,
+    description=(
+        "Multi-agent machine learning project "
+        "planning and construction API."
+    ),
+    version="0.2.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url=None,
+)
+
+
+# ============================================================
+# NEW: GOAL-ONLY PROJECT PLANNING ROUTER
+# ============================================================
+
+app.include_router(
+    project_planning_router
+)
+
+
+# ============================================================
+# SERVICE ACCESS HELPERS
+# ============================================================
+
+def _datasets(request: Request) -> DatasetService:
+
+    service = getattr(
+        request.app.state,
+        "dataset_service",
+        None,
+    )
+
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Dataset service unavailable.",
+        )
+
+    return service
+
+
+def _runs(request: Request) -> RunService:
+
+    service = getattr(
+        request.app.state,
+        "run_service",
+        None,
+    )
+
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Run service unavailable.",
+        )
+
+    return service
+
+
+# ============================================================
+# ERROR HANDLING
+# ============================================================
+
+def _data_error(exc: Exception) -> HTTPException:
+
+    if isinstance(exc, (FileNotFoundError, KeyError)):
+        return HTTPException(
+            status_code=404,
+            detail="Dataset not found.",
+        )
+
+    if isinstance(
+        exc,
+        (
+            DatasetIntegrityError,
+            ValueError,
+            ValidationError,
         ),
-        lifespan=lifespan,
-        debug=False,
-        docs_url="/docs",
-        redoc_url=None,
-        openapi_url="/openapi.json",
-    )
-
-    application.state.ready = False
-    application.state.dataset_service = None
-    application.state.run_service = None
-
-    application.include_router(
-        datasets_router,
-        prefix="/api",
-    )
-
-    application.include_router(
-        runs_router,
-        prefix="/api",
-    )
-
-    @application.get(
-        "/api/health",
-        tags=["Health"],
-        summary="Check whether the API process responds",
-    )
-    async def health(response: Response) -> dict[str, str]:
-        response.headers["Cache-Control"] = "no-store"
-
-        return {
-            "status": "ok",
-            "service": "AutoAudit",
-        }
-
-    @application.get(
-        "/api/ready",
-        tags=["Health"],
-        summary="Check whether application services have started",
-        responses={
-            503: {
-                "description": "Application services are not ready.",
-            }
-        },
-    )
-    async def readiness(
-        request: Request,
-        response: Response,
-    ) -> dict[str, str]:
-        state = request.app.state
-
-        ready = (
-            bool(getattr(state, "ready", False))
-            and getattr(state, "dataset_service", None) is not None
-            and getattr(state, "run_service", None) is not None
+    ):
+        return HTTPException(
+            status_code=422,
+            detail="Dataset is invalid or corrupted.",
         )
 
-        response.headers["Cache-Control"] = "no-store"
-        response.status_code = 200 if ready else 503
-
-        return {
-            "status": "ready" if ready else "not_ready",
-            "service": "AutoAudit",
-        }
-
-    @application.exception_handler(Exception)
-    async def unexpected_error(
-        request: Request,
-        exc: Exception,
-    ) -> JSONResponse:
-        logger.error(
-            "Unhandled AutoAudit server error.",
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "detail": {
-                    "code": "internal_error",
-                    "message": "An unexpected server error occurred.",
-                }
-            },
-            headers={
-                "Cache-Control": "no-store",
-            },
-        )
-
-    # Serve only public frontend assets at /static/css, /static/js, etc.
-    # Restart the server if the frontend directory is created later.
-    if frontend_root.is_dir():
-        application.mount(
-            "/static",
-            StaticFiles(
-                directory=str(frontend_root),
-                follow_symlink=False,
-            ),
-            name="static",
-        )
-
-    @application.get(
-        "/",
-        include_in_schema=False,
+    logger.exception(
+        "Unexpected dataset storage error"
     )
-    def home(request: Request) -> Response:
-        index_path = frontend_root / "index.html"
 
-        if (
-            not index_path.is_symlink()
-            and index_path.is_file()
-            and index_path.stat().st_size > 0
-        ):
-            return FileResponse(
-                index_path,
-                media_type="text/html",
-                headers={
-                    "Cache-Control": "no-cache",
-                },
+    return HTTPException(
+        status_code=500,
+        detail="Dataset service failed.",
+    )
+
+
+def _run_error(exc: Exception) -> HTTPException:
+
+    if isinstance(exc, KeyError):
+        return HTTPException(
+            status_code=404,
+            detail="Run not found.",
+        )
+
+    if isinstance(
+        exc,
+        (
+            RunConflictError,
+            WorkspaceIntegrityError,
+        ),
+    ):
+        return HTTPException(
+            status_code=409,
+            detail=str(exc),
+        )
+
+    if isinstance(
+        exc,
+        (
+            ValueError,
+            ValidationError,
+        ),
+    ):
+        return HTTPException(
+            status_code=422,
+            detail=str(exc)[:600],
+        )
+
+    logger.exception(
+        "Unexpected run-service failure"
+    )
+
+    return HTTPException(
+        status_code=500,
+        detail=(
+            "Run service failed. "
+            "Check server logs."
+        ),
+    )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get(
+    "/api/health",
+    tags=["Health"],
+)
+async def health() -> dict:
+
+    return {
+        "status": "ok",
+        "service": "AutoAudit",
+    }
+
+
+@app.get(
+    "/api/ready",
+    tags=["Health"],
+)
+async def ready(
+    request: Request,
+) -> dict:
+
+    _datasets(request)
+    _runs(request)
+
+    return {
+        "status": "ready",
+        "service": "AutoAudit",
+    }
+
+
+# ============================================================
+# DATASET UPLOAD
+# ============================================================
+
+@app.post(
+    "/api/datasets",
+    status_code=201,
+    tags=["Datasets"],
+)
+async def upload_dataset(
+    request: Request,
+    file: UploadFile = File(...),
+) -> dict:
+
+    if (
+        not file.filename
+        or not file.filename.lower().endswith(".csv")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Upload a .csv file.",
+        )
+
+    content = bytearray()
+
+    try:
+        while True:
+
+            chunk = await file.read(
+                1024 * 1024
             )
 
-        # Empty scaffold files should open the API docs
-        # instead of displaying a blank UI.
-        return RedirectResponse(
-            url=str(request.url_for("swagger_ui_html")),
-            status_code=307,
-            headers={
-                "Cache-Control": "no-store",
-            },
+            if not chunk:
+                break
+
+            if (
+                len(content) + len(chunk)
+                > MAX_UPLOAD_BYTES
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail="CSV exceeds upload limit.",
+                )
+
+            content.extend(chunk)
+
+    finally:
+        await file.close()
+
+    if not content:
+        raise HTTPException(
+            status_code=422,
+            detail="CSV file is empty.",
         )
 
-    return application
+    try:
+        return await asyncio.to_thread(
+            _datasets(request).save_bytes,
+            filename=file.filename,
+            content=bytes(content),
+        )
+
+    except Exception as exc:
+        raise _data_error(exc) from None
 
 
-app = create_app()
+# ============================================================
+# LIST DATASETS
+# ============================================================
+
+@app.get(
+    "/api/datasets",
+    tags=["Datasets"],
+)
+async def list_datasets(
+    request: Request,
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=100,
+    ),
+) -> list[dict]:
+
+    try:
+        return await asyncio.to_thread(
+            _datasets(request).list_datasets,
+            limit=limit,
+        )
+
+    except Exception as exc:
+        raise _data_error(exc) from None
+
+
+# ============================================================
+# DATASET METADATA
+# ============================================================
+
+@app.get(
+    "/api/datasets/{dataset_id}",
+    tags=["Datasets"],
+)
+async def get_dataset(
+    request: Request,
+    dataset_id: UUID,
+) -> dict:
+
+    try:
+        return await asyncio.to_thread(
+            _datasets(request).get_metadata,
+            dataset_id,
+        )
+
+    except Exception as exc:
+        raise _data_error(exc) from None
+
+
+# ============================================================
+# DATASET PROFILE
+# ============================================================
+
+@app.get(
+    "/api/datasets/{dataset_id}/profile",
+    tags=["Datasets"],
+)
+async def get_dataset_profile(
+    request: Request,
+    dataset_id: UUID,
+) -> dict:
+
+    try:
+        return await asyncio.to_thread(
+            _datasets(request).get_profile,
+            dataset_id,
+        )
+
+    except Exception as exc:
+        raise _data_error(exc) from None
+
+
+# ============================================================
+# CREATE DATASET-BACKED ML RUN
+# ============================================================
+
+@app.post(
+    "/api/runs",
+    status_code=202,
+    tags=["Runs"],
+)
+async def create_run(
+    request: Request,
+    payload: RunCreateRequest,
+) -> dict:
+
+    try:
+        return await _runs(request).start(
+            payload
+        )
+
+    except Exception as exc:
+        raise _run_error(exc) from None
+
+
+# ============================================================
+# LIST ALL RUNS
+# ============================================================
+
+@app.get(
+    "/api/runs",
+    tags=["Runs"],
+)
+async def list_runs(
+    request: Request,
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=100,
+    ),
+) -> list[dict]:
+
+    try:
+        return await _runs(request).list_runs(
+            limit=limit
+        )
+
+    except Exception as exc:
+        raise _run_error(exc) from None
+
+
+# ============================================================
+# GET ONE RUN
+# ============================================================
+
+@app.get(
+    "/api/runs/{run_id}",
+    tags=["Runs"],
+)
+async def get_run(
+    request: Request,
+    run_id: UUID,
+) -> dict:
+
+    try:
+        return await _runs(request).get(
+            run_id
+        )
+
+    except Exception as exc:
+        raise _run_error(exc) from None
+
+
+# ============================================================
+# HUMAN-IN-THE-LOOP REVIEW
+# ============================================================
+
+@app.post(
+    "/api/runs/{run_id}/reviews",
+    tags=["Runs"],
+)
+async def review_run(
+    request: Request,
+    run_id: UUID,
+    decision: ReviewDecision,
+) -> dict:
+
+    try:
+        return await _runs(request).review(
+            run_id,
+            decision,
+        )
+
+    except Exception as exc:
+        raise _run_error(exc) from None
+
+
+# ============================================================
+# RETRY FAILED OR INTERRUPTED RUN
+# ============================================================
+
+@app.post(
+    "/api/runs/{run_id}/retry",
+    tags=["Runs"],
+)
+async def retry_run(
+    request: Request,
+    run_id: UUID,
+) -> dict:
+
+    try:
+        return await _runs(request).retry(
+            run_id
+        )
+
+    except Exception as exc:
+        raise _run_error(exc) from None
+
+
+# ============================================================
+# NEW: GENERATED PROJECT PROGRESS
+# ============================================================
+
+@app.get(
+    "/api/runs/{run_id}/project",
+    tags=["Runs"],
+)
+async def get_project_progress(
+    request: Request,
+    run_id: UUID,
+) -> dict:
+    """
+    Show the Planner's project structure and the actual
+    generation status of each file.
+
+    This endpoint does not create or download a ZIP.
+    """
+
+    try:
+        return await _runs(
+            request
+        ).get_project_progress(
+            run_id
+        )
+
+    except Exception as exc:
+        raise _run_error(exc) from None
+
+
+# ============================================================
+# EXISTING AUTOAUDIT FRONTEND
+# ============================================================
+
+frontend_dir = Path(
+    settings.frontend_dir
+)
+
+if frontend_dir.is_dir():
+
+    app.mount(
+        "/static",
+        StaticFiles(
+            directory=frontend_dir
+        ),
+        name="static",
+    )
+
+
+@app.get(
+    "/",
+    include_in_schema=False,
+)
+async def index() -> FileResponse:
+
+    html_path = (
+        frontend_dir / "index.html"
+    )
+
+    if not html_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Frontend not installed.",
+        )
+
+    return FileResponse(
+        html_path,
+        media_type="text/html",
+    )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, Any, TypeVar
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi.responses import FileResponse
 from pydantic import (
     AwareDatetime,
     BaseModel,
@@ -355,4 +357,83 @@ async def retry_run(
         result,
         request,
         response,
+    )
+
+
+@router.post(
+    "/{run_id}/handoff",
+    name="autoaudit_create_handoff",
+    summary="Create and download the pre-audit handoff ZIP",
+    response_class=FileResponse,
+    responses={
+        200: {
+            "description": (
+                "Handoff ZIP for a trained run. The leakage audit "
+                "has not been performed by this endpoint."
+            ),
+            "content": {
+                "application/zip": {},
+            },
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Handoff could not be created from the current run.",
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "The run or its artifact was not found.",
+        },
+        409: {
+            "model": ErrorResponse,
+            "description": "The run has not completed training.",
+        },
+        503: {
+            "model": ErrorResponse,
+            "description": "The handoff archive is unavailable.",
+        },
+    },
+)
+async def create_handoff(
+    run_id: UUID,
+    service: ServiceDependency,
+) -> FileResponse:
+    """Create a ZIP from verified training artifacts and stream it to the client."""
+    result = await _invoke(
+        service.create_handoff,
+        run_id,
+    )
+
+    archive_value = result.get("handoff_zip")
+    if not isinstance(archive_value, str) or not archive_value.strip():
+        logger.error(
+            "Handoff service returned no archive path; run_id=%s",
+            run_id,
+        )
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "handoff_unavailable",
+            "The handoff archive is not available. Try again shortly.",
+        )
+
+    archive_path = Path(archive_value)
+    if archive_path.suffix.lower() != ".zip" or not archive_path.is_file():
+        logger.error(
+            "Handoff archive is missing or invalid; run_id=%s",
+            run_id,
+        )
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "handoff_unavailable",
+            "The handoff archive is not available. Try again shortly.",
+        )
+
+    return FileResponse(
+        path=archive_path,
+        media_type="application/zip",
+        filename=f"autoaudit-handoff-{run_id}.zip",
+        headers={
+            "Cache-Control": "no-store",
+            "X-AutoAudit-Status": "ready_for_audit",
+            "X-AutoAudit-Audit-Status": "not_performed",
+        },
     )

@@ -1,3 +1,19 @@
+
+"""AutoAudit Run Service.
+
+Coordinates the first three agents:
+1. Planner
+2. Data Engineering
+3. Model Training
+
+The Planner registers the entire final project blueprint first.
+Later agents progressively create real files in a shared workspace.
+
+This service does NOT create the final downloadable project ZIP.
+Auditing, refactoring, testing, verification, documentation, and
+packaging belong to subsequent team agents.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +24,7 @@ import logging
 import multiprocessing
 import os
 import tempfile
+
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
@@ -15,6 +32,7 @@ from pathlib import Path
 from uuid import UUID
 
 import aiosqlite
+
 from filelock import FileLock
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -26,27 +44,37 @@ from app.agents.model_training_agent import (
     execution_plan_sha256,
 )
 from app.agents.planner_agent import PlannerAgent
+
 from app.core.config import get_settings
+
 from app.graph.workflow import (
     ReviewDecision,
     build_workflow,
     create_initial_state,
 )
+
 from app.llm.provider_factory import create_llm_provider
 from app.ml.model_factory import TrainingRuntimeSettings
 from app.ml.training import TrainingExecutor
+
 from app.schemas.cleaning import ExecutionPlan
 from app.schemas.run import RunCreateRequest, RunLLMConfiguration
+
 from app.services.artifact_service import ArtifactService
 from app.services.cleaning_review_store import CleaningReviewStore
+
+from app.services.project_workspace_service import (
+    ProjectWorkspaceService,
+    WorkspaceIntegrityError,
+)
+from app.services.project_code_generation_service import (
+    ProjectCodeGenerationService,
+)
 
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "runtime"
-)
+DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "runtime"
 
 
 class RunConflictError(ValueError):
@@ -73,8 +101,13 @@ def _write_json(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
+# ============================================================
+# TRAINING WORKER
+# ============================================================
+
 def _training_worker(job_dir: str) -> None:
     """Top-level function required by Windows multiprocessing spawn."""
+
     directory = Path(job_dir)
 
     job = json.loads(
@@ -97,9 +130,7 @@ def _training_worker(job_dir: str) -> None:
         run_id=UUID(arguments["run_id"]),
         revision=arguments["revision"],
         dataset_id=UUID(arguments["dataset_id"]),
-        dataset_bytes=(
-            directory / "dataset.csv"
-        ).read_bytes(),
+        dataset_bytes=(directory / "dataset.csv").read_bytes(),
         execution_plan=plan,
         decision=TrainingDecision.model_validate(
             arguments["decision"]
@@ -129,6 +160,10 @@ def _training_worker(job_dir: str) -> None:
     )
 
 
+# ============================================================
+# LAZY LLM PROVIDER
+# ============================================================
+
 class _RunProvider:
     """Inspecting saved state does not open an LLM connection."""
 
@@ -136,7 +171,6 @@ class _RunProvider:
         self.configuration = RunLLMConfiguration.model_validate(
             configuration
         )
-
         self.provider = None
 
     async def generate_structured(self, **kwargs):
@@ -145,26 +179,16 @@ class _RunProvider:
                 configuration=self.configuration
             )
 
-        return await self.provider.generate_structured(
-            **kwargs
-        )
+        return await self.provider.generate_structured(**kwargs)
 
     async def close(self) -> None:
         if self.provider is None:
             return
 
-        closer = getattr(
-            self.provider,
-            "aclose",
-            None,
-        )
+        closer = getattr(self.provider, "aclose", None)
 
         if closer is None:
-            closer = getattr(
-                self.provider,
-                "close",
-                None,
-            )
+            closer = getattr(self.provider, "close", None)
 
         if callable(closer):
             result = closer()
@@ -173,22 +197,50 @@ class _RunProvider:
                 await result
 
 
+# ============================================================
+# WORKSPACE-AWARE PLANNER
+# ============================================================
+
+class _WorkspacePlanner(PlannerAgent):
+    """Registers the validated blueprint before downstream agents run."""
+
+    def __init__(
+        self,
+        *,
+        workspace: ProjectWorkspaceService,
+        run_id: UUID | str,
+        provider,
+    ):
+        super().__init__(provider=provider)
+
+        self._workspace_for_project = workspace
+        self._run_id_for_project = UUID(str(run_id))
+
+    async def plan_project(self, **kwargs):
+        blueprint = await super().plan_project(**kwargs)
+
+        await asyncio.to_thread(
+            self._workspace_for_project.initialize,
+            run_id=self._run_id_for_project,
+            blueprint=blueprint,
+        )
+
+        return blueprint
+
+
+# ============================================================
+# MAIN RUN SERVICE
+# ============================================================
+
 class RunService:
-    """
-    Single-server coordinator with persistent checkpoints.
+    """Persistent coordinator for the first three AutoAudit agents.
 
-    Open one instance using:
-        async with RunService(dataset_loader=...)
+    Usage:
+        async with RunService(dataset_loader=...) as service:
+            await service.start(request)
 
-    dataset_loader(UUID) returns the original stored CSV bytes.
-
-    Public methods:
-        start
-        get
-        list_runs
-        review
-        retry
-        close
+    Existing runs can resume using their original workflow setting.
+    New runs enable project-blueprint generation by default.
     """
 
     def __init__(
@@ -201,11 +253,11 @@ class RunService:
         max_active_runs: int = 2,
         max_pending_runs: int = 8,
         max_revisions: int = 5,
+        enable_project_blueprint: bool = True,
     ) -> None:
+
         if not callable(dataset_loader):
-            raise TypeError(
-                "dataset_loader must be callable."
-            )
+            raise TypeError("dataset_loader must be callable.")
 
         if not 10 <= training_timeout_seconds <= 3600:
             raise ValueError(
@@ -234,45 +286,43 @@ class RunService:
                 "max_revisions must be 1..10."
             )
 
+        if type(enable_project_blueprint) is not bool:
+            raise TypeError(
+                "enable_project_blueprint must be a boolean."
+            )
+
         self.root = Path(root_dir).resolve()
-
         self.database_dir = self.root / "database"
-
         self.review_path = (
-            self.database_dir
-            / "cleaning_reviews.sqlite3"
+            self.database_dir / "cleaning_reviews.sqlite3"
         )
-
-        self.receipts = (
-            self.root / "training_receipts"
-        )
+        self.receipts = self.root / "training_receipts"
 
         self.dataset_loader = dataset_loader
 
         self.runtime = TrainingRuntimeSettings.model_validate(
-            (
-                runtime or TrainingRuntimeSettings()
-            ).model_dump()
+            (runtime or TrainingRuntimeSettings()).model_dump()
         )
 
         self.training_timeout = training_timeout_seconds
         self.max_pending_runs = max_pending_runs
         self.max_revisions = max_revisions
 
+        self.enable_project_blueprint = enable_project_blueprint
+
         self._actions = asyncio.Lock()
-
-        self._capacity = asyncio.Semaphore(
-            max_active_runs
-        )
-
+        self._capacity = asyncio.Semaphore(max_active_runs)
         self._training_slot = asyncio.Semaphore(1)
 
         self._tasks: dict[str, asyncio.Task] = {}
-
         self._stack = AsyncExitStack()
 
         self._opened = False
         self._closed = False
+
+    # ========================================================
+    # APPLICATION STARTUP
+    # ========================================================
 
     async def __aenter__(self):
         if self._opened or self._closed:
@@ -284,21 +334,16 @@ class RunService:
             parents=True,
             exist_ok=True,
         )
-
         self.receipts.mkdir(
             parents=True,
             exist_ok=True,
         )
 
         lock = FileLock(
-            str(
-                self.database_dir
-                / "run_service.lock"
-            )
+            str(self.database_dir / "run_service.lock")
         )
 
         lock.acquire(timeout=0)
-
         self._stack.callback(lock.release)
 
         try:
@@ -309,6 +354,10 @@ class RunService:
             self.artifacts = ArtifactService(
                 review_store=self.reviews,
                 root_dir=self.root / "runs",
+            )
+
+            self.project_workspace = ProjectWorkspaceService(
+                root_dir=self.root / "runs"
             )
 
             self._db = await self._stack.enter_async_context(
@@ -328,10 +377,7 @@ class RunService:
 
             self._saver = await self._stack.enter_async_context(
                 AsyncSqliteSaver.from_conn_string(
-                    str(
-                        self.database_dir
-                        / "workflow.sqlite3"
-                    )
+                    str(self.database_dir / "workflow.sqlite3")
                 )
             )
 
@@ -352,7 +398,6 @@ class RunService:
             await self._db.commit()
 
             self._opened = True
-
             return self
 
         except BaseException:
@@ -362,6 +407,10 @@ class RunService:
 
     async def __aexit__(self, *_):
         await self.close()
+
+    # ========================================================
+    # INTERNAL STORAGE
+    # ========================================================
 
     def _check_open(self) -> None:
         if not self._opened or self._closed:
@@ -407,15 +456,43 @@ class RunService:
 
         await self._db.commit()
 
+    # ========================================================
+    # LANGGRAPH INTEGRATION
+    # ========================================================
+
     def _graph(self, data: dict):
-        provider = _RunProvider(
-            data["llm"]
+        """Recreate graph using each run's persisted configuration."""
+
+        provider = _RunProvider(data["llm"])
+
+        # Old runs preserve legacy behavior.
+        project_enabled = bool(
+            data.get("project_blueprint_enabled", False)
+        )
+
+        writer = (
+            ProjectCodeGenerationService(
+                provider=provider,
+                workspace=self.project_workspace,
+                artifacts=self.artifacts,
+                review_store=self.reviews,
+            )
+            if project_enabled
+            else None
+        )
+
+        planner = (
+            _WorkspacePlanner(
+                provider=provider,
+                workspace=self.project_workspace,
+                run_id=data["run_id"],
+            )
+            if project_enabled
+            else PlannerAgent(provider=provider)
         )
 
         graph = build_workflow(
-            planner=PlannerAgent(
-                provider=provider
-            ),
+            planner=planner,
             engineer=DataEngineeringAgent(
                 provider=provider
             ),
@@ -428,6 +505,8 @@ class RunService:
             training_runner=self._train,
             checkpointer=self._saver,
             max_revisions=data["max_revisions"],
+            enable_project_blueprint=project_enabled,
+            project_file_writer=writer,
         )
 
         return graph, provider
@@ -454,19 +533,21 @@ class RunService:
             name=f"run:{run_id}",
         )
 
+    # ========================================================
+    # CREATE NEW RUN
+    # ========================================================
+
     async def start(
         self,
         request: RunCreateRequest,
     ) -> dict:
+
         request = RunCreateRequest.model_validate_json(
             request.model_dump_json()
         )
 
         run_id = str(request.request_id)
-
-        source = request.model_dump(
-            mode="json"
-        )
+        source = request.model_dump(mode="json")
 
         async with self._actions:
             self._check_open()
@@ -544,6 +625,9 @@ class RunService:
                     "initial_state": initial,
                     "llm": llm.model_dump(mode="json"),
                     "max_revisions": self.max_revisions,
+                    "project_blueprint_enabled": (
+                        self.enable_project_blueprint
+                    ),
                     "status": "queued",
                     "error": None,
                     "pending_review": None,
@@ -551,15 +635,19 @@ class RunService:
                 }
 
                 await self._save(data)
-
                 self._schedule(data)
 
         return await self.get(run_id)
+
+    # ========================================================
+    # RUN STATUS
+    # ========================================================
 
     async def get(
         self,
         run_id: UUID | str,
     ) -> dict:
+
         run_id = str(UUID(str(run_id)))
 
         async with self._actions:
@@ -591,10 +679,175 @@ class RunService:
                 ],
             }
 
+    # ========================================================
+    # NEW: GENERATED PROJECT PROGRESS
+    # ========================================================
+
+    async def get_project_progress(
+        self,
+        run_id: UUID | str,
+    ) -> dict:
+        """Read actual project file progress, not just planned filenames.
+
+        This does not certify the completed project or its final ZIP.
+        """
+
+        normalized = str(UUID(str(run_id)))
+
+        async with self._actions:
+            self._check_open()
+
+            data = await self._load(normalized)
+
+            graph, _ = self._graph(data)
+
+            snapshot = await graph.aget_state(
+                self._config(normalized)
+            )
+
+            state = (
+                snapshot.values
+                or data["initial_state"]
+            )
+
+            blueprint = state.get("project_blueprint")
+
+            if not blueprint:
+                return {
+                    "run_id": normalized,
+                    "planned": False,
+                    "files": {},
+                    "final_zip_ready": False,
+                }
+
+            try:
+                manifest = await asyncio.to_thread(
+                    self.project_workspace.get_manifest,
+                    run_id=UUID(normalized),
+                )
+
+            except WorkspaceIntegrityError as exc:
+                raise RunConflictError(
+                    "The project manifest is unavailable or invalid."
+                ) from exc
+
+            return {
+                "run_id": normalized,
+                "planned": True,
+                "project_slug": manifest["project_slug"],
+                "blueprint_revision": manifest[
+                    "blueprint_revision"
+                ],
+                "files": {
+                    path: {
+                        "producer": info["producer"],
+                        "status": info["status"],
+                        "revision": info["revision"],
+                        "sha256": info["sha256"],
+                    }
+                    for path, info in manifest["files"].items()
+                },
+                "stage_status": manifest["stage_status"],
+                "final_zip_ready": False,
+            }
+
+    # ========================================================
+    # CONSTRUCTION-STAGE HANDOFF
+    # ========================================================
+
+    async def create_handoff(
+        self,
+        run_id: UUID | str,
+    ) -> dict:
+        """Legacy artifact handoff for runs without project generation.
+
+        New full-project runs cannot expose a ZIP here.
+        The final project ZIP belongs to the later Packaging Agent.
+        """
+
+        normalized_run_id = str(UUID(str(run_id)))
+
+        async with self._actions:
+            self._check_open()
+
+            data = await self._load(normalized_run_id)
+
+            if data.get("project_blueprint_enabled", False):
+                raise RunConflictError(
+                    "The final project ZIP is not available at this "
+                    "stage. Remaining team agents must audit, test, "
+                    "verify, document and package the project."
+                )
+
+            graph, _ = self._graph(data)
+
+            snapshot = await graph.aget_state(
+                self._config(normalized_run_id)
+            )
+
+            state = (
+                snapshot.values
+                or data["initial_state"]
+            )
+
+            if state.get("status") != "ready_for_audit":
+                raise RunConflictError(
+                    "Handoff is available only after training."
+                )
+
+            manifest = state.get("artifact")
+
+            if not isinstance(manifest, dict):
+                raise ValueError(
+                    "Training artifact manifest is missing."
+                )
+
+            if manifest.get("run_id") != normalized_run_id:
+                raise ValueError(
+                    "Artifact manifest belongs to another run."
+                )
+
+            try:
+                artifact_id = UUID(
+                    str(manifest["artifact_id"])
+                )
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(
+                    "Artifact manifest has an invalid artifact ID."
+                ) from None
+
+            verified_manifest = self.artifacts.get_manifest(
+                run_id=UUID(normalized_run_id),
+                artifact_id=artifact_id,
+            )
+
+            if verified_manifest != manifest:
+                raise ValueError(
+                    "Artifact manifest verification failed."
+                )
+
+            archive_path = self.artifacts.create_handoff_zip(
+                run_id=UUID(normalized_run_id),
+                artifact_id=artifact_id,
+            )
+
+            return {
+                "run_id": normalized_run_id,
+                "artifact_id": str(artifact_id),
+                "status": "ready_for_audit",
+                "audit_status": "not_performed",
+                "handoff_zip": str(archive_path),
+            }
+
+    # ========================================================
+    # LIST RUNS
+    # ========================================================
+
     async def list_runs(
         self,
         limit: int = 50,
     ) -> list[dict]:
+
         if not 1 <= limit <= 100:
             raise ValueError(
                 "limit must be 1..100."
@@ -629,11 +882,16 @@ class RunService:
 
         return result
 
+    # ========================================================
+    # HUMAN-IN-THE-LOOP REVIEW
+    # ========================================================
+
     async def review(
         self,
         run_id: UUID | str,
         decision: ReviewDecision | dict,
     ) -> dict:
+
         run_id = str(UUID(str(run_id)))
 
         command = ReviewDecision.model_validate(
@@ -649,7 +907,7 @@ class RunService:
                 data["last_review"]
                 and data["last_review"]["decision"] == command
             ):
-                # Identical repeated submissions are idempotent.
+                # Identical repeated decisions are idempotent.
                 pass
 
             else:
@@ -664,9 +922,7 @@ class RunService:
                     self._config(run_id)
                 )
 
-                interrupts = self._interrupts(
-                    snapshot
-                )
+                interrupts = self._interrupts(snapshot)
 
                 if len(interrupts) != 1:
                     raise RunConflictError(
@@ -741,15 +997,19 @@ class RunService:
                 )
 
                 await self._save(data)
-
                 self._schedule(data)
 
         return await self.get(run_id)
+
+    # ========================================================
+    # RETRY
+    # ========================================================
 
     async def retry(
         self,
         run_id: UUID | str,
     ) -> dict:
+
         run_id = str(UUID(str(run_id)))
 
         async with self._actions:
@@ -776,14 +1036,16 @@ class RunService:
             )
 
             await self._save(data)
-
             self._schedule(data)
 
         return await self.get(run_id)
 
+    # ========================================================
+    # WORKFLOW EXECUTION
+    # ========================================================
+
     async def _drive(self, data: dict) -> None:
         run_id = data["run_id"]
-
         provider = None
 
         status = "interrupted"
@@ -794,7 +1056,6 @@ class RunService:
             async with self._capacity:
                 async with self._actions:
                     data["status"] = "running"
-
                     await self._save(data)
 
                 graph, provider = self._graph(data)
@@ -810,7 +1071,6 @@ class RunService:
                 )
 
                 pending = data["pending_review"]
-
                 invoke = True
 
                 if not snapshot.values:
@@ -830,7 +1090,7 @@ class RunService:
                     invoke = False
 
                 else:
-                    # Continue unfinished work from its checkpoint.
+                    # Resume checkpointed unfinished work.
                     value = None
 
                 if invoke:
@@ -895,11 +1155,16 @@ class RunService:
                         None,
                     )
 
+    # ========================================================
+    # TRAINING RECEIPT VERIFICATION
+    # ========================================================
+
     def _read_receipt(
         self,
         path: Path,
         job_hash: str,
     ) -> dict:
+
         output = json.loads(
             path.read_text("utf-8")
         )
@@ -942,7 +1207,12 @@ class RunService:
             "manifest": manifest,
         }
 
+    # ========================================================
+    # TRAINING SUBPROCESS
+    # ========================================================
+
     async def _train(self, **kwargs) -> dict:
+
         async with self._training_slot:
             raw = kwargs["dataset_bytes"]
 
@@ -996,6 +1266,7 @@ class RunService:
                 prefix="training-",
                 dir=self.root,
             ) as temporary:
+
                 directory = Path(temporary)
 
                 await asyncio.to_thread(
@@ -1069,7 +1340,12 @@ class RunService:
                     process.join(timeout=0)
                     process.close()
 
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
     async def close(self) -> None:
+
         async with self._actions:
             if not self._opened or self._closed:
                 return
@@ -1089,5 +1365,4 @@ class RunService:
         )
 
         await self._stack.aclose()
-
         self._opened = False

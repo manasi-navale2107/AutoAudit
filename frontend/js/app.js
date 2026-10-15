@@ -1,31 +1,27 @@
+
 /**
- * AutoAudit browser entry point.
- * All HTTP requests go through api.js.
+ * AutoAudit: One Unified ML Project Workflow
+ *
+ * Goal -> Blueprint -> Dataset -> Data Engineering
+ * -> Human Approval -> Training -> Results
  */
 
-import {
-  api,
-  ApiError,
-  createRequestId,
-  isAbortError,
-  MAX_CSV_BYTES,
-} from "./api.js";
+const $ = (id) => document.getElementById(id);
 
-import {
-  initI18n,
-  setLanguage,
-  getLanguage,
-  t,
-  formatNumber,
-  formatDateTime,
-  onLanguageChange,
-} from "./i18n.js";
+const asText = (x) =>
+  x == null
+    ? "—"
+    : typeof x === "object"
+      ? JSON.stringify(x)
+      : String(x);
 
-import { createReviewController } from "./review.js";
-import { createVoiceController } from "./voice.js";
+const pretty = (x) => JSON.stringify(x, null, 2);
 
-const UUID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const validId = (x) =>
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(x || "");
+
+const isObject = (x) =>
+  x !== null && typeof x === "object" && !Array.isArray(x);
 
 const ACTIVE = new Set(["queued", "running"]);
 
@@ -36,2128 +32,2011 @@ const WAITING = new Set([
 
 const RETRYABLE = new Set(["failed", "interrupted"]);
 
-const EXTRA = {
-  checkRequest: {
-    en: "Check request status",
-    mr: "Request ची स्थिती तपासा",
-    hi: "Request की स्थिति देखें",
-  },
-  resendRequest: {
-    en: "Retry the same request",
-    mr: "तोच request पुन्हा पाठवा",
-    hi: "वही request फिर भेजें",
-  },
-};
+// ============================================================
+// GLOBAL UI HELPERS
+// ============================================================
 
-const object = (value) =>
-  value !== null &&
-  typeof value === "object" &&
-  !Array.isArray(value);
+function notice(id, value = "") {
+  const element = $(id);
+  if (!element) return;
 
-const invalid = () =>
-  new ApiError("The API response has an invalid structure.", {
-    code: "invalid_response",
-  });
+  element.textContent = value;
+  element.hidden = !value;
 
-const text = (value) =>
-  value == null
-    ? "—"
-    : typeof value === "object"
-      ? JSON.stringify(value)
-      : String(value);
-
-const pretty = (value) => JSON.stringify(value, null, 2);
-
-const number = (value) =>
-  typeof value === "number" && Number.isFinite(value)
-    ? formatNumber(value)
-    : "—";
-
-const statusText = (value) =>
-  t(
-    `status.${value}`,
-    {},
-    t("status.unknown", { status: text(value) }),
-  );
-
-const extra = (key) =>
-  t(
-    `run.${key}`,
-    {},
-    EXTRA[key][getLanguage()] ?? EXTRA[key].en,
-  );
-
-function validateSummary(value) {
-  if (
-    !object(value) ||
-    !UUID.test(value.run_id ?? "") ||
-    typeof value.status !== "string" ||
-    typeof value.updated_at !== "string" ||
-    !Number.isFinite(Date.parse(value.updated_at))
-  ) {
-    throw invalid();
+  if (id === "app-error-message") {
+    $("app-error").hidden = !value;
   }
-
-  return value;
 }
 
-function validateRun(value, expectedId) {
-  validateSummary(value);
+// Prevent native form submissions to "/".
+// This also protects forms if a module fails to initialize.
 
-  if (
-    value.run_id.toLowerCase() !== expectedId ||
-    !object(value.state) ||
-    !Array.isArray(value.interrupts)
-  ) {
-    throw invalid();
+function protectForms() {
+  const ids = [
+    "project-plan-form",
+    "upload-form",
+    "run-form",
+    "review-form",
+    "clarification-form",
+  ];
+
+  for (const id of ids) {
+    $(id)?.addEventListener(
+      "submit",
+      (event) => event.preventDefault(),
+      { capture: true }
+    );
   }
-
-  for (const key of ["training_report", "artifact"]) {
-    const item = value.state[key];
-
-    if (
-      item != null &&
-      (
-        !object(item) ||
-        item.run_id !== value.run_id ||
-        item.test_evaluated !== false ||
-        item.audit_status !== "not_performed"
-      )
-    ) {
-      throw invalid();
-    }
-  }
-
-  const report = value.state.training_report;
-  const artifact = value.state.artifact;
-
-  if (report && !Array.isArray(report.candidates)) {
-    throw invalid();
-  }
-
-  if (artifact && !object(artifact.files)) {
-    throw invalid();
-  }
-
-  if (
-    report?.candidates.some(
-      (item) =>
-        !object(item) ||
-        typeof item.model !== "string" ||
-        typeof item.eligible_for_selection !== "boolean" ||
-        typeof item.validation_score !== "number" ||
-        !Number.isFinite(item.validation_score) ||
-        !Array.isArray(item.warning_types),
-    )
-  ) {
-    throw invalid();
-  }
-
-  if (
-    value.status === "ready_for_audit" &&
-    (!report || !artifact)
-  ) {
-    throw invalid();
-  }
-
-  return value;
 }
 
-function validateDataset(value, expectedId = null) {
-  if (
-    !object(value) ||
-    !UUID.test(value.dataset_id ?? "") ||
-    typeof value.filename !== "string" ||
-    !Array.isArray(value.columns) ||
-    !value.columns.length ||
-    value.columns.some(
-      (column) =>
-        typeof column !== "string" ||
-        !column.trim(),
-    ) ||
-    new Set(value.columns).size !== value.columns.length ||
-    !Number.isSafeInteger(value.row_count) ||
-    value.row_count < 1 ||
-    value.column_count !== value.columns.length ||
-    !Number.isSafeInteger(value.size_bytes) ||
-    value.size_bytes < 1 ||
-    (
-      expectedId &&
-      value.dataset_id.toLowerCase() !== expectedId
-    )
-  ) {
-    throw invalid();
-  }
+// ============================================================
+// APPLICATION BOOT
+// ============================================================
 
-  return value;
+async function boot() {
+  protectForms();
+
+  let application;
+
+  try {
+    const [http, language, reviewModule] =
+      await Promise.all([
+        import("./api.js"),
+        import("./i18n.js"),
+        import("./review.js"),
+      ]);
+
+    // Voice is optional.
+    const voiceModule =
+      await import("./voice.js").catch((error) => {
+        console.warn(
+          "Voice module unavailable:",
+          error
+        );
+        return null;
+      });
+
+    application = createApplication(
+      http,
+      language,
+      reviewModule,
+      voiceModule
+    );
+
+    await application.start();
+
+  } catch (error) {
+    application?.destroy();
+
+    console.error(
+      "AutoAudit startup error:",
+      error
+    );
+
+    notice(
+      "app-error-message",
+      `Frontend could not initialize: ${error.message}`
+    );
+  }
 }
 
-function errorText(error) {
-  let result = t(
-    `errors.${error?.code ?? "generic"}`,
-    {},
-    error?.message || t("errors.generic"),
-  );
+// ============================================================
+// MAIN APPLICATION
+// ============================================================
 
-  const issues = Array.isArray(error?.issues)
-    ? error.issues
-    : [];
+function createApplication(
+  http,
+  i18n,
+  reviewModule,
+  voiceModule
+) {
+  const {
+    api,
+    createRequestId,
+    MAX_CSV_BYTES,
+  } = http;
 
-  for (const issue of issues.slice(0, 4)) {
-    if (typeof issue?.message === "string") {
-      result += `\n${issue.field || ""}: ${issue.message}`;
-    }
-  }
-
-  return result;
-}
-
-export function createApp() {
-  const $ = (id) => {
-    const element = document.getElementById(id);
-
-    if (!element) {
-      throw new Error(`Missing application element: #${id}`);
-    }
-
-    return element;
-  };
-
-  const bindings = new AbortController();
-
-  const reads = new Map();
-  const messages = new Map();
-  const datasets = new Map();
-  const runs = new Map();
-  const uncertainRetries = new Set();
-  const downloads = new Map();
+  const {
+    initI18n,
+    setLanguage,
+    getLanguage,
+    t,
+    formatNumber,
+    formatDateTime,
+    onLanguageChange,
+  } = i18n;
 
   const state = {
     alive: true,
-    started: false,
     ready: false,
     connecting: false,
-    connection: "unknown",
 
-    datasetId: "",
+    datasets: new Map(),
+    selectedDataset: "",
     dataset: null,
     profile: null,
 
-    activeId: null,
-    record: null,
-    selection: 0,
+    runs: new Map(),
+    activeRun: "",
+    run: null,
 
     uploading: false,
-    creating: false,
-    pending: null,
-    checkingCreate: false,
+    creatingRun: false,
     retrying: false,
+    reviewing: false,
 
-    retryAt: 0,
-    pollAt: 0,
-    pollFailures: 0,
-    missingRun: false,
+    pendingRun: null,
+
+    project: {
+      id: "",
+      request: null,
+      result: null,
+      executionId: "",
+      progress: null,
+      busy: false,
+      refreshing: false,
+      uncertain: false,
+    },
   };
-
-  let pollTimer = null;
-  let cooldownTimer = null;
 
   let review = null;
   let voice = null;
+  let pollTimer = null;
+  let pollBusy = false;
 
-  let unsubscribe = () => {};
+  let removeLanguageListener = () => {};
 
-  // Recovery controls for a create request whose response was lost.
-  const recovery = document.createElement("div");
-  recovery.className = "action-row";
-  recovery.hidden = true;
+  const signals = new AbortController();
 
-  const checkCreate = document.createElement("button");
-  const resendCreate = document.createElement("button");
+  // ==========================================================
+  // EVENT HELPERS
+  // ==========================================================
 
-  checkCreate.id = "check-create-button";
-  resendCreate.id = "resend-create-button";
+  function listen(id, eventName, callback) {
+    const node =
+      typeof id === "string" ? $(id) : id;
 
-  for (const button of [checkCreate, resendCreate]) {
-    button.type = "button";
-    button.className = "button button--secondary";
-    recovery.append(button);
-  }
-
-  $("run-form").append(recovery);
-
-  const originalValidation = [
-    $("upload-form").noValidate,
-    $("run-form").noValidate,
-  ];
-
-  $("upload-form").noValidate = true;
-  $("run-form").noValidate = true;
-
-  function paintMessage(id) {
-    const item = messages.get(id);
-
-    const value = item?.error
-      ? errorText(item.error)
-      : item
-        ? t(item.key, item.params)
-        : "";
-
-    const element = $(id);
-
-    element.removeAttribute("data-i18n");
-
-    if (element.textContent !== value) {
-      element.textContent = value;
+    if (!node) {
+      throw new Error(`Missing element: ${id}`);
     }
 
-    element.hidden = !value;
-
-    if (id === "app-error-message") {
-      $("app-error").hidden = !value;
-    }
-  }
-
-  function message(id, value = null, params = {}) {
-    if (!state.alive) return;
-
-    if (value === null) {
-      messages.delete(id);
-    } else {
-      messages.set(
-        id,
-        typeof value === "string"
-          ? { key: value, params }
-          : { error: value },
-      );
-    }
-
-    paintMessage(id);
-  }
-
-  function appError(error) {
-    if (!isAbortError(error)) {
-      message("app-error-message", error);
-    }
-  }
-
-  function bind(target, event, handler) {
-    target.addEventListener(
-      event,
-      (eventObject) => {
+    node.addEventListener(
+      eventName,
+      (event) => {
         try {
-          Promise.resolve(handler(eventObject)).catch(appError);
+          Promise.resolve(
+            callback(event)
+          ).catch(showError);
         } catch (error) {
-          appError(error);
+          showError(error);
         }
       },
-      { signal: bindings.signal },
+      {
+        signal: signals.signal,
+      }
     );
   }
 
-  function cancelRead(name) {
-    reads.get(name)?.abort();
-    reads.delete(name);
-  }
-
-  async function read(
-    name,
-    operation,
-    accept,
-    reject = appError,
-  ) {
-    cancelRead(name);
-
-    const controller = new AbortController();
-    reads.set(name, controller);
-
-    syncControls();
-
-    try {
-      const value = await operation(controller.signal);
-
-      if (
-        !state.alive ||
-        reads.get(name) !== controller
-      ) {
-        return false;
-      }
-
-      accept(value);
-      return true;
-    } catch (error) {
-      if (
-        state.alive &&
-        reads.get(name) === controller &&
-        !isAbortError(error)
-      ) {
-        reject(error);
-      }
-
-      return false;
-    } finally {
-      if (reads.get(name) === controller) {
-        reads.delete(name);
-      }
-
-      if (state.alive) {
-        syncControls();
-        schedulePoll();
-      }
+  function showError(error) {
+    if (
+      !state.alive ||
+      error?.name === "AbortError"
+    ) {
+      return;
     }
-  }
 
-  function cooldown(error) {
-    const delay = Number.isFinite(error?.retryAfterMs)
-      ? Math.max(0, error.retryAfterMs)
-      : error?.status === 429
-        ? 30_000
-        : 0;
-
-    state.retryAt = Math.max(
-      state.retryAt,
-      Date.now() + delay,
+    notice(
+      "app-error-message",
+      error?.message ||
+        "Unexpected error. Check server logs."
     );
 
-    clearTimeout(cooldownTimer);
-
-    function update() {
-      if (!state.alive) return;
-
-      syncControls();
-
-      if (state.retryAt > Date.now()) {
-        cooldownTimer = setTimeout(
-          update,
-          Math.min(state.retryAt - Date.now(), 60_000),
-        );
-      }
-    }
-
-    update();
-
-    if (delay > 0) {
-      message("app-message", "common.retryAfter", {
-        seconds: Math.ceil(delay / 1000),
-      });
-    }
+    console.error(error);
   }
 
-  function syncControls() {
+  const translated = (key, fallback) =>
+    t(key, {}, fallback);
+
+  const number = (x) =>
+    typeof x === "number" &&
+    Number.isFinite(x)
+      ? formatNumber(x)
+      : "—";
+
+  const date = (x) =>
+    x ? formatDateTime(x) : "—";
+
+  // ==========================================================
+  // KEY-VALUE DISPLAY
+  // ==========================================================
+
+  function details(containerId, entries) {
+    const fragment =
+      document.createDocumentFragment();
+
+    for (const [key, value] of entries) {
+      const div =
+        document.createElement("div");
+
+      const dt =
+        document.createElement("dt");
+
+      const dd =
+        document.createElement("dd");
+
+      dt.textContent = translated(key, key);
+      dd.textContent = asText(value);
+
+      div.append(dt, dd);
+      fragment.append(div);
+    }
+
+    $(containerId).replaceChildren(fragment);
+  }
+
+  // ==========================================================
+  // BUTTON AND FORM STATES
+  // ==========================================================
+
+  function sync() {
     if (!state.alive) return;
 
-    const cooling = Date.now() < state.retryAt;
-
-    const formBusy =
+    const blocked =
       state.uploading ||
-      state.creating ||
-      state.pending !== null;
+      state.creatingRun ||
+      Boolean(state.pendingRun);
 
-    const canEdit = state.ready && !formBusy;
+    const p = state.project;
 
-    const canRun =
-      canEdit &&
-      state.dataset !== null &&
-      !reads.has("dataset");
+    const pBusy =
+      p.busy || p.refreshing;
 
-    $("interface-language").disabled = !state.started;
-    $("new-run-button").disabled = !state.started;
-
-    $("refresh-runs-button").disabled =
-      !state.ready || reads.has("history");
+    $("new-run-button").disabled = false;
+    $("interface-language").disabled = false;
 
     $("retry-connection-button").disabled =
       state.connecting;
 
+    $("refresh-runs-button").disabled =
+      !state.ready;
+
     $("upload-fields").disabled =
-      !canEdit || cooling;
+      !state.ready || blocked;
 
     $("dataset-select").disabled =
-      !canEdit || reads.has("datasets");
+      !state.ready || blocked;
 
-    $("run-fields").disabled = !canRun;
+    $("upload-progress").hidden =
+      !state.uploading;
 
-    $("objective").readOnly =
-      Boolean(state.pending);
+    // Hidden legacy form:
+    // Actual runs begin through Continue Training.
 
-    $("start-run-button").disabled =
-      !canRun ||
-      cooling ||
-      Boolean(voice?.busy);
+    $("run-fields").disabled = true;
+    $("start-run-button").disabled = true;
 
-    $("start-run-button").setAttribute(
+    // Project planning
+
+    $("project-plan-fields").disabled =
+      !state.ready ||
+      pBusy ||
+      p.uncertain;
+
+    $("refresh-project-plan-button").disabled =
+      !state.ready ||
+      !p.id ||
+      pBusy;
+
+    $("refresh-project-progress-button").disabled =
+      !state.ready ||
+      !p.executionId ||
+      pBusy;
+
+    // Continue becomes available after
+    // blueprint + actual dataset.
+
+    $("continue-training-button").disabled =
+      !state.ready ||
+      !p.result?.blueprint ||
+      !state.dataset ||
+      blocked ||
+      pBusy;
+
+    $("continue-training-button").setAttribute(
       "aria-busy",
-      String(state.creating),
+      String(state.creatingRun)
     );
 
-    $("upload-button").setAttribute(
-      "aria-busy",
-      String(state.uploading),
-    );
+    const hint = $("project-training-hint");
 
-    $("upload-progress").hidden = !state.uploading;
+    hint.textContent = state.creatingRun
+      ? "Starting Data Engineering and Model Training workflow…"
+      : !p.result?.blueprint
+        ? "First generate a project blueprint."
+        : !state.dataset
+          ? "Now upload or select a dataset to continue."
+          : p.executionId
+            ? "Execution run created. See Agent Progress & Results below."
+            : "Ready. Continue starts the existing dataset-backed agents. The blueprint is not yet persisted into that run.";
 
     $("refresh-run-button").disabled =
       !state.ready ||
-      !state.activeId ||
-      reads.has("run") ||
-      Boolean(review?.busy) ||
-      state.retrying;
+      !state.activeRun ||
+      state.reviewing;
 
-    const retryable = RETRYABLE.has(
-      state.record?.status,
+    const retry = RETRYABLE.has(
+      state.run?.status
     );
 
-    $("retry-run-button").hidden = !retryable;
+    $("retry-run-button").hidden = !retry;
 
     $("retry-run-button").disabled =
       !state.ready ||
-      !retryable ||
+      !retry ||
       state.retrying ||
-      Boolean(review?.busy) ||
-      reads.has("run") ||
-      uncertainRetries.has(state.activeId) ||
-      cooling;
-
-    $("retry-run-button").setAttribute(
-      "aria-busy",
-      String(state.retrying),
-    );
+      state.reviewing;
 
     $("download-report-button").disabled =
-      !state.record?.state?.training_report;
+      !state.run?.state?.training_report;
 
     $("download-manifest-button").disabled =
-      !state.record?.state?.artifact;
-
-    recovery.hidden =
-      !state.pending || state.creating;
-
-    checkCreate.textContent = extra("checkRequest");
-    resendCreate.textContent = extra("resendRequest");
-
-    checkCreate.disabled =
-      !state.ready ||
-      state.checkingCreate ||
-      cooling;
-
-    resendCreate.hidden =
-      state.pending?.mode !== "missing";
-
-    resendCreate.disabled =
-      !state.ready ||
-      state.checkingCreate ||
-      cooling;
+      !state.run?.state?.artifact;
 
     review?.setEnabled(
-      state.ready && !state.retrying,
+      state.ready && !state.retrying
     );
 
-    // Keep the fieldset enabled while speaking,
-    // so the Stop dictation button remains usable.
-    voice?.setEnabled(
-      canRun && !state.activeId,
+    voice?.setEnabled?.(
+      state.ready &&
+      !blocked &&
+      Boolean(state.dataset)
     );
 
-    const badge = $("connection-status");
-
-    const key =
-      state.connection === "unknown"
-        ? "connection.unchecked"
-        : `connection.${state.connection}`;
-
-    badge.dataset.state = state.connection;
-    badge.setAttribute("data-i18n", key);
-    badge.textContent = t(key);
-
-    document.body.dataset.appState =
+    $("connection-status").dataset.state =
       state.ready
         ? "ready"
         : state.connecting
-          ? "booting"
+          ? "checking"
           : "offline";
+
+    $("connection-status").textContent =
+      state.ready
+        ? "Workspace ready"
+        : state.connecting
+          ? "Connecting…"
+          : "Offline";
+
+    document.body.dataset.appState =
+      state.ready ? "ready" : "offline";
   }
 
-  function definitions(id, entries) {
-    const fragment = document.createDocumentFragment();
+  // ==========================================================
+  // DATASET UI
+  // ==========================================================
 
-    for (const [label, value] of entries) {
-      const item = document.createElement("div");
-      const term = document.createElement("dt");
-      const detail = document.createElement("dd");
+  function renderDatasets() {
+    const select = $("dataset-select");
+    const previous = state.selectedDataset;
 
-      term.textContent = t(label);
-      detail.textContent = text(value);
-      detail.className = "preserve-lines";
+    const options =
+      document.createDocumentFragment();
 
-      item.append(term, detail);
-      fragment.append(item);
-    }
-
-    $(id).replaceChildren(fragment);
-  }
-
-  function paintDatasetOptions() {
-    const fragment = document.createDocumentFragment();
-    const placeholder = document.createElement("option");
-
-    placeholder.value = "";
-    placeholder.textContent = t(
-      datasets.size
-        ? "dataset.chooseSaved"
-        : "dataset.noneSaved",
+    options.append(
+      new Option("Choose a saved dataset", "")
     );
 
-    fragment.append(placeholder);
-
-    for (const item of datasets.values()) {
-      const option = document.createElement("option");
-
-      option.value = item.dataset_id.toLowerCase();
-
-      option.textContent =
-        t("dataset.optionLabel", {
-          filename: item.filename,
-          rows: number(item.row_count),
-        }) +
-        ` · ${option.value.slice(0, 8)}`;
-
-      fragment.append(option);
+    for (const data of state.datasets.values()) {
+      options.append(
+        new Option(
+          `${data.filename} (${number(data.row_count)} rows)`,
+          data.dataset_id
+        )
+      );
     }
 
-    $("dataset-select").replaceChildren(fragment);
-    $("dataset-select").value = state.datasetId;
-  }
+    select.replaceChildren(options);
+    select.value = previous;
 
-  function paintDataset() {
-    const item = state.dataset;
+    const data = state.dataset;
 
-    $("dataset-summary").hidden = !item;
+    $("dataset-summary").hidden = !data;
 
     $("dataset-filename").textContent =
-      item?.filename ?? "";
+      data?.filename || "";
 
     $("dataset-row-count").textContent =
-      number(item?.row_count);
+      number(data?.row_count);
 
     $("dataset-column-count").textContent =
-      number(item?.column_count);
+      number(
+        data?.column_count ??
+        data?.columns?.length
+      );
 
-    $("dataset-size").textContent = item
-      ? `${number(item.size_bytes / (1024 * 1024))} MiB`
-      : "—";
+    $("dataset-size").textContent =
+      Number.isFinite(data?.size_bytes)
+        ? `${(data.size_bytes / 1048576).toFixed(2)} MiB`
+        : "—";
 
     $("dataset-profile-json").textContent =
       state.profile ? pretty(state.profile) : "";
 
     const target = $("target-column");
-    const previous = target.value;
+    const old = target.value;
 
-    const fragment = document.createDocumentFragment();
-    const infer = document.createElement("option");
-
-    infer.value = "";
-    infer.textContent = t("run.inferTarget");
-
-    fragment.append(infer);
-
-    for (const column of item?.columns ?? []) {
-      const option = document.createElement("option");
-
-      // Preserve exact CSV column names, including spaces.
-      option.value = column;
-      option.textContent = column;
-
-      fragment.append(option);
-    }
-
-    target.replaceChildren(fragment);
-
-    target.value =
-      item?.columns.includes(previous)
-        ? previous
-        : "";
-  }
-
-  function mergeRuns(items) {
-    items.forEach(validateSummary);
-
-    for (const item of items) {
-      const id = item.run_id.toLowerCase();
-      const existing = runs.get(id);
-
-      if (
-        !existing ||
-        Date.parse(item.updated_at) >=
-          Date.parse(existing.updated_at)
-      ) {
-        runs.set(id, {
-          run_id: id,
-          status: item.status,
-          updated_at: item.updated_at,
-        });
-      }
-    }
-
-    const sorted = [...runs.values()].sort(
-      (a, b) =>
-        Date.parse(b.updated_at) -
-        Date.parse(a.updated_at),
+    target.replaceChildren(
+      new Option(
+        "Let the planner identify it",
+        ""
+      )
     );
 
-    runs.clear();
+    for (const column of data?.columns || []) {
+      target.append(
+        new Option(column, column)
+      );
+    }
 
-    sorted.slice(0, 100).forEach((item) => {
-      runs.set(item.run_id, item);
+    if (data?.columns?.includes(old)) {
+      target.value = old;
+    }
+
+    sync();
+  }
+
+  // ==========================================================
+  // DATASET API
+  // ==========================================================
+
+  async function loadDatasets() {
+    const list = await api.listDatasets({
+      limit: 100,
     });
 
-    paintHistory();
-  }
-
-  function paintHistory() {
-    const focusedId =
-      $("run-list").contains(document.activeElement)
-        ? document.activeElement?.dataset?.runId
-        : null;
-
-    const fragment = document.createDocumentFragment();
-
-    for (const item of runs.values()) {
-      const row =
-        $("run-item-template").content.cloneNode(true);
-
-      const button = row.querySelector("button");
-
-      button.dataset.runId = item.run_id;
-
-      button.setAttribute(
-        "aria-label",
-        t("history.openRun", { id: item.run_id }),
-      );
-
-      if (item.run_id === state.activeId) {
-        button.setAttribute("aria-current", "true");
-      }
-
-      row.querySelector(
-        '[data-field="title"]',
-      ).textContent = t("history.runLabel", {
-        id: item.run_id.slice(0, 8),
-      });
-
-      row.querySelector(
-        '[data-field="status"]',
-      ).textContent = statusText(item.status);
-
-      const time = row.querySelector(
-        '[data-field="updated_at"]',
-      );
-
-      time.textContent = formatDateTime(item.updated_at);
-      time.dateTime = item.updated_at;
-
-      fragment.append(row);
+    if (!Array.isArray(list)) {
+      throw new Error("Invalid dataset list.");
     }
 
-    $("run-list").replaceChildren(fragment);
+    if (!state.alive) return;
 
-    $("run-list-empty").hidden =
-      runs.size !== 0 || reads.has("history");
+    state.datasets.clear();
 
-    if (focusedId) {
-      const button = [
-        ...$("run-list").querySelectorAll("button"),
-      ].find(
-        (item) => item.dataset.runId === focusedId,
-      );
-
-      button?.focus({ preventScroll: true });
-    }
-  }
-
-  function paintRun() {
-    const record = state.record;
-    const current = record?.state ?? {};
-
-    $("new-run-panel").hidden =
-      Boolean(state.activeId);
-
-    $("run-panel").hidden = !state.activeId;
-
-    $("active-run-id").textContent =
-      state.activeId ?? "";
-
-    $("active-run-objective").textContent =
-      current.request?.objective ?? "";
-
-    $("run-status").textContent = record
-      ? statusText(record.status)
-      : t("common.loading");
-
-    $("run-status").dataset.status =
-      record?.status ?? "unknown";
-
-    $("run-progress").hidden =
-      !record || !ACTIVE.has(record.status);
-
-    $("run-updated-at").textContent = record
-      ? formatDateTime(record.updated_at)
-      : "—";
-
-    if (record) {
-      $("run-updated-at").dateTime = record.updated_at;
-    } else {
-      $("run-updated-at").removeAttribute("datetime");
-    }
-
-    definitions("active-run-settings", [
-      ["settings.provider", current.request?.provider],
-      ["settings.model", current.request?.model],
-      [
-        "settings.responseLanguage",
-        current.request?.language,
-      ],
-      ["dataset.id", current.request?.dataset_id],
-    ]);
-
-    const plan = current.execution_plan;
-
-    $("plan-panel").hidden = !object(plan);
-    $("plan-json").textContent = plan
-      ? pretty(plan)
-      : "";
-
-    if (object(plan)) {
-      const split = plan.split ?? {};
-
-      const percent = (value) =>
-        typeof value === "number"
-          ? formatNumber(value, {
-              style: "percent",
-              maximumFractionDigits: 2,
-            })
-          : "—";
-
-      definitions("plan-summary", [
-        ["plan.target", plan.target_column],
-        ["plan.metric", plan.primary_metric],
-        ["plan.split", split.strategy],
-        [
-          "plan.trainFraction",
-          percent(split.train_fraction),
-        ],
-        [
-          "plan.validationFraction",
-          percent(split.validation_fraction),
-        ],
-        [
-          "plan.testFraction",
-          percent(split.test_fraction),
-        ],
-        [
-          "plan.candidateModels",
-          plan.candidate_models?.join(", "),
-        ],
-        ["plan.rationale", split.rationale],
-      ]);
-    }
-
-    const report = current.training_report;
-
-    let stage = plan ? 1 : 0;
-
-    if (
-      current.training_decision ||
-      [
-        "approved",
-        "training",
-        "trained",
-        "ready_for_audit",
-      ].includes(current.status)
-    ) {
-      stage = 2;
-    }
-
-    if (record?.status === "awaiting_clarification") {
-      stage = 0;
-    }
-
-    if (record?.status === "awaiting_review") {
-      stage = 1;
-    }
-
-    for (const [index, name] of [
-      "planner",
-      "engineering",
-      "training",
-    ].entries()) {
-      let value =
-        index < stage || report
-          ? "completed"
-          : "waiting";
-
-      if (index === stage && !report && record) {
-        value =
-          record.status === "queued"
-            ? "waiting"
-            : record.status;
-      }
-
-      $(`${name}-step`).dataset.status = value;
-
-      $(`${name}-status`).setAttribute(
-        "data-i18n",
-        `status.${value}`,
-      );
-
-      $(`${name}-status`).textContent =
-        statusText(value);
-    }
-
-    const helpKey = {
-      failed: "run.failedHelp",
-      interrupted: "run.interruptedHelp",
-      needs_review: "run.needsReviewHelp",
-      rejected: "run.rejectedHelp",
-    }[record?.status];
-
-    $("run-error-panel").hidden = !helpKey;
-
-    const details =
-      record?.error ??
-      (
-        record?.status === "needs_review"
-          ? current.planner_decision
-          : null
-      );
-
-    $("run-error-message").textContent = helpKey
-      ? [
-          t(helpKey),
-          details == null ? "" : text(details),
-          uncertainRetries.has(state.activeId)
-            ? t("run.retryUnknown")
-            : "",
-        ]
-          .filter(Boolean)
-          .join("\n")
-      : "";
-
-    $("training-results-panel").hidden = !report;
-
-    $("training-report-json").textContent = report
-      ? pretty(report)
-      : "";
-
-    if (!report) return;
-
-    definitions("training-summary", [
-      ["training.selectedModel", report.selected_model],
-      ["training.primaryMetric", report.primary_metric],
-      [
-        "training.selectedScore",
-        number(report.selected_validation_score),
-      ],
-      [
-        "training.approvedRevision",
-        number(report.approved_revision),
-      ],
-      [
-        "training.trainRows",
-        number(report.split_counts?.train),
-      ],
-      [
-        "training.validationRows",
-        number(report.split_counts?.validation),
-      ],
-      [
-        "training.testRows",
-        number(report.split_counts?.test),
-      ],
-      ["training.testEvaluated", t("common.no")],
-      ["training.auditStatus", t("training.notPerformed")],
-      ["training.selectionRule", report.selection_rule],
-    ]);
-
-    const fragment = document.createDocumentFragment();
-
-    for (const candidate of report.candidates) {
-      const row =
-        $("model-row-template").content.cloneNode(true);
-
-      const selected =
-        candidate.model === report.selected_model;
-
-      row.querySelector("tr").dataset.selected =
-        String(selected);
-
-      row.querySelector(
-        '[data-field="model"]',
-      ).textContent = text(candidate.model);
-
-      row.querySelector(
-        '[data-field="status"]',
-      ).textContent = t(
-        selected
-          ? "training.selected"
-          : candidate.eligible_for_selection === true
-            ? "training.eligible"
-            : "training.ineligible",
-      );
-
-      row.querySelector(
-        '[data-field="primary_score"]',
-      ).textContent = number(candidate.validation_score);
-
-      const notes = [
-        t("training.elapsed", {
-          seconds: number(candidate.elapsed_seconds),
-        }),
-      ];
-
-      if (candidate.warning_types?.length) {
-        notes.push(
-          t("training.warnings", {
-            warnings: candidate.warning_types.join(", "),
-          }),
+    for (const data of list) {
+      if (validId(data.dataset_id)) {
+        state.datasets.set(
+          data.dataset_id.toLowerCase(),
+          data
         );
       }
-
-      row.querySelector(
-        '[data-field="notes"]',
-      ).textContent = notes.join("\n");
-
-      fragment.append(row);
     }
 
-    $("model-table-body").replaceChildren(fragment);
-
-    const manifest = current.artifact;
-
-    definitions(
-      "artifact-summary",
-      manifest
-        ? [
-            ["artifact.id", manifest.artifact_id],
-            [
-              "artifact.status",
-              statusText(manifest.status),
-            ],
-            [
-              "artifact.created",
-              formatDateTime(manifest.created_at),
-            ],
-            [
-              "artifact.fileCount",
-              number(Object.keys(manifest.files).length),
-            ],
-            [
-              "artifact.files",
-              Object.keys(manifest.files).join("\n"),
-            ],
-          ]
-        : [
-            [
-              "artifact.status",
-              t("artifact.manifestUnavailable"),
-            ],
-          ],
-    );
+    renderDatasets();
   }
 
-  function acceptRun(value, reviewed = false) {
-    if (!state.activeId) return false;
-
-    validateRun(value, state.activeId);
-
-    if (
-      state.record &&
-      Date.parse(value.updated_at) <
-        Date.parse(state.record.updated_at)
-    ) {
-      return false;
-    }
-
-    if (!reviewed && !review.render(value)) {
-      return false;
-    }
-
-    state.record = JSON.parse(JSON.stringify(value));
-    state.pollFailures = 0;
-    state.missingRun = false;
-
-    mergeRuns([value]);
-    paintRun();
-    syncControls();
-
-    return true;
-  }
-
-  function schedulePoll() {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-
-    if (
-      !state.alive ||
-      !state.ready ||
-      document.hidden ||
-      !state.activeId ||
-      state.missingRun ||
-      reads.has("run") ||
-      review?.busy ||
-      state.retrying
-    ) {
-      return;
-    }
-
-    if (
-      state.record &&
-      !ACTIVE.has(state.record.status) &&
-      !WAITING.has(state.record.status)
-    ) {
-      return;
-    }
-
-    const base = WAITING.has(state.record?.status)
-      ? 10_000
-      : 2_500;
-
-    const delay = Math.max(
-      state.pollAt - Date.now(),
-      Math.min(
-        30_000,
-        base * (2 ** Math.min(state.pollFailures, 4)),
-      ),
-    );
-
-    pollTimer = setTimeout(() => {
-      if (Date.now() < state.pollAt) {
-        schedulePoll();
-      } else {
-        void loadRun();
-      }
-    }, Math.min(60_000, delay));
-  }
-
-  function loadRun() {
-    if (
-      !state.alive ||
-      !state.ready ||
-      !state.activeId ||
-      state.retrying ||
-      (
-        review?.busy &&
-        review.runId === state.activeId
-      )
-    ) {
-      return Promise.resolve(false);
-    }
-
-    const id = state.activeId;
-    const selection = state.selection;
-
-    return read(
-      "run",
-      (signal) => api.getRun(id, { signal }),
-      (value) => {
-        if (selection !== state.selection) return;
-
-        acceptRun(value);
-        message("app-message");
-      },
-      (error) => {
-        state.pollFailures += 1;
-        state.missingRun = error.status === 404;
-
-        const delay = Number.isFinite(error.retryAfterMs)
-          ? Math.max(0, error.retryAfterMs)
-          : error.status === 429
-            ? 30_000
-            : 0;
-
-        state.pollAt = Date.now() + delay;
-
-        message("app-message", "run.statusStale");
-        appError(error);
-      },
-    );
-  }
-
-  function selectRun(id, record = null) {
-    if (!UUID.test(id)) throw invalid();
-
-    voice.clear();
-
-    cancelRead("run");
-    clearTimeout(pollTimer);
-
-    state.selection += 1;
-    state.activeId = id.toLowerCase();
-    state.record = null;
-    state.missingRun = false;
-
-    review.clear();
-
-    message(
-      "app-message",
-      record ? "run.created" : "run.loading",
-    );
-
-    paintRun();
-    paintHistory();
-    syncControls();
-
-    $("run-panel").focus({ preventScroll: true });
-
-    if (record) {
-      acceptRun(record);
-      schedulePoll();
-    } else {
-      void loadRun();
-    }
-  }
-
-  function newRun() {
-    voice.clear();
-
-    cancelRead("run");
-    clearTimeout(pollTimer);
-
-    state.selection += 1;
-    state.activeId = null;
-    state.record = null;
-
-    review.clear();
-
-    // Preserve an uncertain create request until it is resolved.
-    if (!state.pending) {
-      $("run-form").reset();
-
-      message("run-form-error");
-      $("objective").removeAttribute("aria-invalid");
-    }
-
-    message("app-message");
-
-    paintRun();
-    paintHistory();
-    paintDataset();
-    countObjective();
-    syncControls();
-  }
-
-  async function refreshRun() {
-    if (
-      !state.ready ||
-      !state.activeId ||
-      state.retrying ||
-      review.busy
-    ) {
-      return;
-    }
-
-    const id = state.activeId;
-    const selection = state.selection;
-
-    cancelRead("run");
-
-    try {
-      // review.refresh() also checks uncertain review submissions.
-      const ok =
-        review.runId === id
-          ? await review.refresh()
-          : await loadRun();
-
-      if (ok && selection === state.selection) {
-        uncertainRetries.delete(id);
-
-        message("app-message");
-        message("app-error-message");
-
-        paintRun();
-      }
-    } catch (error) {
-      appError(error);
-    } finally {
-      syncControls();
-      schedulePoll();
-    }
-  }
-
-  function loadHistory() {
-    message("run-list-status", "history.loading");
-
-    return read(
-      "history",
-      (signal) =>
-        api.listRuns({
-          limit: 100,
-          signal,
-        }),
-      (items) => {
-        mergeRuns(items);
-
-        message("run-list-status", "history.loaded", {
-          count: number(runs.size),
-        });
-
-        $("run-list-empty").hidden = runs.size !== 0;
-      },
-      (error) => {
-        message("run-list-status", "history.loadFailed");
-        appError(error);
-      },
-    );
-  }
-
-  function loadDatasets() {
-    return read(
-      "datasets",
-      (signal) =>
-        api.listDatasets({
-          limit: 100,
-          signal,
-        }),
-      (items) => {
-        items.forEach((item) => validateDataset(item));
-
-        for (const item of items) {
-          datasets.set(
-            item.dataset_id.toLowerCase(),
-            item,
-          );
-        }
-
-        paintDatasetOptions();
-      },
-      (error) => {
-        message("upload-error", "dataset.listFailed");
-        appError(error);
-      },
-    );
-  }
-
-  function chooseDataset(id) {
-    voice.clear();
-
-    cancelRead("dataset");
-    cancelRead("profile");
-
-    state.datasetId = id;
+  async function chooseDataset(id) {
+    state.selectedDataset = id;
     state.dataset = null;
     state.profile = null;
 
-    $("dataset-profile-panel").open = false;
-    $("target-column").value = "";
+    renderDatasets();
 
-    message("dataset-profile-status");
-    message("upload-error");
+    if (!id) return;
 
-    paintDataset();
-    syncControls();
+    try {
+      const data = await api.getDataset(id);
 
-    if (!id) {
-      message("upload-status");
-      return Promise.resolve(false);
+      if (
+        !state.alive ||
+        state.selectedDataset !== id
+      ) {
+        return;
+      }
+
+      if (
+        !validId(data?.dataset_id) ||
+        !Array.isArray(data.columns)
+      ) {
+        throw new Error(
+          "Invalid dataset metadata."
+        );
+      }
+
+      state.dataset = data;
+      state.datasets.set(id, data);
+
+      notice(
+        "upload-status",
+        `Selected ${data.filename}`
+      );
+
+      notice("upload-error");
+
+      renderDatasets();
+
+    } catch (error) {
+      notice(
+        "upload-error",
+        error.message
+      );
     }
-
-    message("upload-status", "dataset.loading");
-
-    return read(
-      "dataset",
-      (signal) => api.getDataset(id, { signal }),
-      (value) => {
-        state.dataset = validateDataset(value, id);
-
-        datasets.set(id, value);
-
-        paintDatasetOptions();
-        paintDataset();
-
-        message("upload-status", "dataset.selected", {
-          filename: value.filename,
-        });
-      },
-      (error) => {
-        message("upload-status");
-        message("upload-error", error);
-      },
-    );
   }
 
-  function loadProfile() {
-    if (
-      !state.dataset ||
-      state.profile ||
-      reads.has("profile") ||
-      !$("dataset-profile-panel").open
-    ) {
-      return;
-    }
+  // ==========================================================
+  // UPLOAD DATASET
+  // ==========================================================
 
-    const id = state.datasetId;
-
-    message(
-      "dataset-profile-status",
-      "dataset.profileLoading",
-    );
-
-    void read(
-      "profile",
-      (signal) =>
-        api.getDatasetProfile(id, { signal }),
-      (value) => {
-        state.profile = value;
-
-        $("dataset-profile-json").textContent =
-          pretty(value);
-
-        message(
-          "dataset-profile-status",
-          "dataset.profileLoaded",
-        );
-      },
-      (error) => {
-        message(
-          "dataset-profile-status",
-          "dataset.profileFailed",
-        );
-
-        appError(error);
-      },
-    );
-  }
-
-  async function upload(event) {
+  async function uploadDataset(event) {
     event.preventDefault();
 
     if (
       !state.ready ||
-      state.uploading ||
-      state.pending ||
-      state.creating ||
-      Date.now() < state.retryAt
+      state.uploading
     ) {
       return;
     }
 
-    const file = $("dataset-file").files?.[0];
+    const file =
+      $("dataset-file").files?.[0];
 
-    const key = !file
-      ? "validation.fileRequired"
-      : !file.name.toLowerCase().endsWith(".csv")
-        ? "validation.csvRequired"
-        : file.size === 0
-          ? "validation.emptyFile"
-          : file.size > MAX_CSV_BYTES
-            ? "validation.fileTooLarge"
-            : null;
-
-    if (key) {
-      message("upload-error", key);
-      $("dataset-file").focus();
+    if (
+      !file ||
+      !file.name.toLowerCase().endsWith(".csv") ||
+      file.size < 1 ||
+      file.size > MAX_CSV_BYTES
+    ) {
+      notice(
+        "upload-error",
+        "Select a nonempty CSV file under 25 MB."
+      );
       return;
     }
 
     state.uploading = true;
 
-    voice.cancel();
-    cancelRead("dataset");
+    notice("upload-error");
 
-    message("upload-error");
-    message("upload-status", "dataset.uploading");
+    notice(
+      "upload-status",
+      "Uploading CSV…"
+    );
 
-    syncControls();
+    sync();
 
     try {
-      const value = validateDataset(
-        await api.uploadDataset(file),
-      );
+      const data =
+        await api.uploadDataset(file);
 
-      if (!state.alive) return;
+      if (!validId(data?.dataset_id)) {
+        throw new Error(
+          "Invalid upload response."
+        );
+      }
 
-      cancelRead("datasets");
+      const id =
+        data.dataset_id.toLowerCase();
 
-      datasets.set(
-        value.dataset_id.toLowerCase(),
-        value,
-      );
+      state.datasets.set(id, data);
 
       $("dataset-file").value = "";
 
-      await chooseDataset(
-        value.dataset_id.toLowerCase(),
-      );
+      await chooseDataset(id);
+
     } catch (error) {
-      if (!state.alive) return;
-
-      cooldown(error);
-      message("upload-status");
-
-      const unknown =
-        error.outcomeUnknown ||
-        error.code === "invalid_response";
-
-      message(
+      notice(
         "upload-error",
-        unknown ? "dataset.uploadUnknown" : error,
+        error.message
       );
-
-      if (unknown) {
-        await loadDatasets();
-      }
     } finally {
       state.uploading = false;
-
-      if (state.alive) {
-        syncControls();
-      }
+      sync();
     }
   }
 
-  function countObjective() {
-    $("objective-count").textContent = formatNumber(
-      $("objective").value.length,
-      { maximumFractionDigits: 0 },
-    );
-  }
+  // ==========================================================
+  // DATASET PROFILE
+  // ==========================================================
 
-  function payload() {
-    const objective = $("objective").value.trim();
-
-    let key = !state.dataset
-      ? "validation.datasetRequired"
-      : [...objective].length < 5 ||
-          $("objective").value.length > 5000
-        ? "validation.objectiveLength"
-        : null;
-
-    const target = $("target-column").value;
-    const provider = $("llm-provider").value;
-    const language = $("response-language").value;
-
+  async function loadProfile() {
     if (
-      !key &&
-      target &&
-      !state.dataset.columns.includes(target)
-    ) {
-      key = "validation.targetColumn";
-    }
-
-    if (
-      !key &&
-      !["", "groq", "ollama"].includes(provider)
-    ) {
-      key = "validation.provider";
-    }
-
-    if (
-      !key &&
-      !["", "en", "mr", "hi"].includes(language)
-    ) {
-      key = "validation.language";
-    }
-
-    if (key) {
-      message("run-form-error", key);
-
-      if (key === "validation.objectiveLength") {
-        $("objective").setAttribute(
-          "aria-invalid",
-          "true",
-        );
-
-        $("objective").focus();
-      }
-
-      return null;
-    }
-
-    return Object.freeze({
-      request_id: createRequestId(),
-      dataset_id: state.datasetId,
-      objective,
-
-      ...(target ? { target_column: target } : {}),
-      ...(provider ? { provider } : {}),
-      ...(language ? { language } : {}),
-    });
-  }
-
-  async function postCreate() {
-    if (
-      !state.ready ||
-      state.creating ||
-      !state.pending ||
-      Date.now() < state.retryAt
+      !state.selectedDataset ||
+      !$("dataset-profile-panel").open ||
+      state.profile
     ) {
       return;
     }
 
-    const pending = state.pending;
-    const selection = state.selection;
+    const id = state.selectedDataset;
 
-    state.creating = true;
-    pending.mode = "posting";
-
-    message("run-form-error");
-    message("app-message", "run.creating");
-
-    syncControls();
+    notice(
+      "dataset-profile-status",
+      "Loading profile…"
+    );
 
     try {
-      const value = validateRun(
-        await api.createRun(pending.payload),
-        pending.payload.request_id,
+      const profile =
+        await api.getDatasetProfile(id);
+
+      if (
+        !state.alive ||
+        id !== state.selectedDataset
+      ) {
+        return;
+      }
+
+      state.profile = profile;
+
+      $("dataset-profile-json").textContent =
+        pretty(profile);
+
+      notice(
+        "dataset-profile-status",
+        "Profile loaded."
       );
 
-      if (!state.alive) return;
-
-      state.pending = null;
-
-      mergeRuns([value]);
-      message("run-form-error");
-
-      if (selection === state.selection) {
-        selectRun(value.run_id, value);
-      }
     } catch (error) {
-      if (!state.alive) return;
-
-      cooldown(error);
-
-      if (
-        error.outcomeUnknown ||
-        error.code === "invalid_response" ||
-        !(error instanceof ApiError)
-      ) {
-        pending.mode = "unknown";
-
-        message("run-form-error", "run.creationUnknown", {
-          id: pending.payload.request_id,
-        });
-      } else {
-        state.pending = null;
-        message("run-form-error", error);
-      }
-
-      if (
-        selection === state.selection &&
-        Date.now() >= state.retryAt
-      ) {
-        message("app-message");
-      }
-    } finally {
-      state.creating = false;
-
-      if (state.alive) {
-        syncControls();
-      }
+      notice(
+        "dataset-profile-status",
+        error.message
+      );
     }
   }
 
-  async function submitRun(event) {
+  // ==========================================================
+  // RUN HISTORY
+  // ==========================================================
+
+  function renderHistory() {
+    const fragment =
+      document.createDocumentFragment();
+
+    const runs = [
+      ...state.runs.values(),
+    ].sort(
+      (a, b) =>
+        Date.parse(b.updated_at || 0) -
+        Date.parse(a.updated_at || 0)
+    );
+
+    for (const item of runs.slice(0, 100)) {
+      const clone =
+        $("run-item-template")
+          .content.cloneNode(true);
+
+      const button =
+        clone.querySelector("button");
+
+      button.dataset.runId =
+        item.run_id;
+
+      button.setAttribute(
+        "aria-current",
+        String(item.run_id === state.activeRun)
+      );
+
+      clone.querySelector(
+        '[data-field="title"]'
+      ).textContent =
+        `Run ${item.run_id.slice(0, 8)}`;
+
+      clone.querySelector(
+        '[data-field="status"]'
+      ).textContent =
+        translated(
+          `status.${item.status}`,
+          item.status || "Unknown"
+        );
+
+      const time =
+        clone.querySelector(
+          '[data-field="updated_at"]'
+        );
+
+      time.textContent =
+        date(item.updated_at);
+
+      if (item.updated_at) {
+        time.dateTime = item.updated_at;
+      }
+
+      fragment.append(clone);
+    }
+
+    $("run-list").replaceChildren(fragment);
+
+    $("run-list-empty").hidden =
+      runs.length > 0;
+  }
+
+  function rememberRun(run) {
+    if (!validId(run?.run_id)) return;
+
+    state.runs.set(
+      run.run_id.toLowerCase(),
+      {
+        run_id: run.run_id.toLowerCase(),
+        status: run.status,
+        updated_at:
+          run.updated_at ||
+          new Date().toISOString(),
+      }
+    );
+
+    renderHistory();
+  }
+
+  async function loadHistory() {
+    notice(
+      "run-list-status",
+      "Loading runs…"
+    );
+
+    try {
+      const list = await api.listRuns({
+        limit: 100,
+      });
+
+      if (!Array.isArray(list)) {
+        throw new Error(
+          "Invalid run list."
+        );
+      }
+
+      if (!state.alive) return;
+
+      state.runs.clear();
+
+      for (const item of list) {
+        rememberRun(item);
+      }
+
+      notice(
+        "run-list-status",
+        `${list.length} run(s) loaded.`
+      );
+
+    } catch (error) {
+      notice(
+        "run-list-status",
+        error.message
+      );
+    }
+  }
+
+  // ==========================================================
+  // MASTER PROJECT BLUEPRINT UI
+  // ==========================================================
+
+  function renderProject() {
+    const p = state.project;
+
+    $("project-blueprint-panel").hidden =
+      !p.id;
+
+    $("project-plan-id").textContent =
+      p.id;
+
+    const blueprint =
+      p.result?.blueprint;
+
+    $("project-blueprint-json").textContent =
+      blueprint ? pretty(blueprint) : "";
+
+    $("project-dataset-status").textContent =
+      p.busy
+        ? "Creating project blueprint…"
+        : p.result?.status === "awaiting_dataset"
+          ? "Blueprint ready; upload a real dataset before training."
+          : p.result?.status === "planned"
+            ? "Blueprint ready; continue with a dataset-backed run."
+            : p.result?.status === "failed"
+              ? asText(
+                  p.result.error ||
+                  "Planning failed"
+                )
+              : p.id
+                ? "Waiting for Planner response."
+                : "";
+
+    const files =
+      Array.isArray(blueprint?.files)
+        ? blueprint.files
+        : [];
+
+    const receipts =
+      p.progress?.files || {};
+
+    let done = 0;
+
+    const fragment =
+      document.createDocumentFragment();
+
+    for (const file of files) {
+      if (!file?.path) continue;
+
+      const status =
+        receipts[file.path]?.status ||
+        "planned";
+
+      if (
+        ["created", "revised"].includes(status)
+      ) {
+        done++;
+      }
+
+      const li =
+        document.createElement("li");
+
+      li.className = "run-list-item";
+
+      li.textContent =
+        `${file.path} — ` +
+        `${file.producer || "Agent"} (${status})`;
+
+      fragment.append(li);
+    }
+
+    $("project-planned-file-list")
+      .replaceChildren(fragment);
+
+    $("project-file-progress").hidden =
+      files.length === 0;
+
+    $("project-file-progress").value =
+      files.length
+        ? 100 * done / files.length
+        : 0;
+
+    $("project-file-status").textContent =
+      files.length
+        ? `${done} of ${files.length} files confirmed generated. ` +
+          (
+            p.executionId
+              ? "Execution progress is tracked separately."
+              : "Blueprint is only a plan; files are not generated yet."
+          )
+        : "No planned files yet.";
+
+    sync();
+  }
+
+  // ==========================================================
+  // VALIDATE PROJECT RESPONSE
+  // ==========================================================
+
+  function validateProject(data, id) {
+    const allowed = [
+      "planning",
+      "planned",
+      "awaiting_dataset",
+      "needs_clarification",
+      "unsupported",
+      "failed",
+    ];
+
+    if (
+      !isObject(data) ||
+      data.run_id?.toLowerCase() !== id ||
+      !allowed.includes(data.status) ||
+      (
+        data.blueprint != null &&
+        !Array.isArray(data.blueprint.files)
+      )
+    ) {
+      throw new Error(
+        "Unexpected project-planning response."
+      );
+    }
+
+    return data;
+  }
+
+  // ==========================================================
+  // STEP 1: CREATE PROJECT BLUEPRINT
+  // ==========================================================
+
+  async function createProject(event) {
     event.preventDefault();
 
     if (
       !state.ready ||
-      state.pending ||
-      state.creating ||
-      state.uploading ||
-      reads.has("dataset") ||
-      voice.busy ||
-      Date.now() < state.retryAt
+      state.project.busy
     ) {
       return;
     }
 
-    const request = payload();
+    const objective =
+      $("project-goal").value.trim();
 
-    if (!request) return;
+    if (
+      objective.length < 5 ||
+      objective.length > 5000
+    ) {
+      notice(
+        "project-plan-error",
+        "Describe your ML goal in 5–5000 characters."
+      );
+      return;
+    }
 
-    voice.clear();
+    const useDataset =
+      $("project-use-dataset").checked;
 
-    state.pending = {
-      payload: request,
-      mode: "posting",
+    if (
+      useDataset &&
+      !state.dataset
+    ) {
+      notice(
+        "project-plan-error",
+        "Select a dataset first, or uncheck the optional dataset box."
+      );
+      return;
+    }
+
+    const request = {
+      request_id: createRequestId(),
+      objective,
+      dataset_id:
+        useDataset
+          ? state.selectedDataset
+          : null,
     };
 
-    await postCreate();
-  }
-
-  async function checkPending() {
-    if (
-      !state.pending ||
-      state.creating ||
-      state.checkingCreate ||
-      !state.ready ||
-      Date.now() < state.retryAt
-    ) {
-      return;
+    if ($("project-provider").value) {
+      request.provider =
+        $("project-provider").value;
     }
 
-    const pending = state.pending;
-    const selection = state.selection;
+    if ($("project-language").value) {
+      request.language =
+        $("project-language").value;
+    }
 
-    state.checkingCreate = true;
-    pending.mode = "unknown";
+    state.project = {
+      id: request.request_id,
+      request,
+      result: null,
+      executionId: "",
+      progress: null,
+      busy: true,
+      refreshing: false,
+      uncertain: false,
+    };
 
-    syncControls();
+    notice("project-plan-error");
+
+    notice(
+      "project-plan-status",
+      "Generating master project blueprint…"
+    );
+
+    renderProject();
 
     try {
-      const value = validateRun(
-        await api.getRun(pending.payload.request_id),
-        pending.payload.request_id,
-      );
+      const result =
+        await api.createProjectPlan(request);
 
       if (
         !state.alive ||
-        state.pending !== pending
+        state.project.id !== request.request_id
       ) {
         return;
       }
 
-      state.pending = null;
+      state.project.result =
+        validateProject(
+          result,
+          request.request_id
+        );
 
-      message("run-form-error");
-      mergeRuns([value]);
+      notice(
+        "project-plan-status",
+        "Blueprint response received. Upload/select dataset to continue."
+      );
 
-      if (selection === state.selection) {
-        selectRun(value.run_id, value);
-      }
     } catch (error) {
-      if (!state.alive) return;
-
-      cooldown(error);
-
-      if (error.status === 404) {
-        // A user may explicitly resend the same immutable payload.
-        pending.mode = "missing";
-      } else {
-        appError(error);
+      if (
+        !state.alive ||
+        state.project.id !== request.request_id
+      ) {
+        return;
       }
 
-      message("run-form-error", "run.creationUnknown", {
-        id: pending.payload.request_id,
-      });
-    } finally {
-      state.checkingCreate = false;
+      state.project.uncertain =
+        Boolean(error.outcomeUnknown);
 
-      if (state.alive) {
-        syncControls();
+      notice(
+        "project-plan-error",
+        error.message
+      );
+
+      notice(
+        "project-plan-status",
+        error.outcomeUnknown
+          ? "Request outcome uncertain. Use Refresh Blueprint rather than submitting again."
+          : "Planner request failed; check the error above."
+      );
+
+    } finally {
+      if (
+        state.project.id === request.request_id
+      ) {
+        state.project.busy = false;
+        renderProject();
       }
     }
   }
+
+  // ==========================================================
+  // REFRESH BLUEPRINT
+  // ==========================================================
+
+  async function refreshProject() {
+    const p = state.project;
+
+    if (
+      !state.ready ||
+      !p.id ||
+      p.busy ||
+      p.refreshing
+    ) {
+      return;
+    }
+
+    p.refreshing = true;
+    sync();
+
+    try {
+      p.result = validateProject(
+        await api.getProjectPlan(p.id),
+        p.id
+      );
+
+      p.uncertain = false;
+
+      notice("project-plan-error");
+
+      notice(
+        "project-plan-status",
+        "Blueprint refreshed."
+      );
+
+    } catch (error) {
+      notice(
+        "project-plan-error",
+        error.message
+      );
+    } finally {
+      p.refreshing = false;
+      renderProject();
+    }
+  }
+
+  // ==========================================================
+  // REFRESH PROJECT FILE PROGRESS
+  // ==========================================================
+
+  async function refreshProjectProgress() {
+    const p = state.project;
+
+    if (
+      !state.ready ||
+      !p.executionId ||
+      p.busy ||
+      p.refreshing
+    ) {
+      return;
+    }
+
+    p.refreshing = true;
+    sync();
+
+    try {
+      const value =
+        await api.getProjectProgress(
+          p.executionId
+        );
+
+      if (!isObject(value?.files)) {
+        throw new Error(
+          "Invalid generated-project progress response."
+        );
+      }
+
+      p.progress = value;
+
+      notice(
+        "project-plan-status",
+        "Execution file progress refreshed."
+      );
+
+    } catch (error) {
+      notice(
+        "project-plan-status",
+        `Progress unavailable: ${error.message}`
+      );
+    } finally {
+      p.refreshing = false;
+      renderProject();
+    }
+  }
+
+  // ==========================================================
+  // RUN DETAILS AND AGENT PROGRESS
+  // ==========================================================
+
+  function renderRun() {
+    const r = state.run;
+    const data = r?.state || {};
+    const report = data.training_report;
+
+    // Keep the main project form visible.
+    $("run-panel").hidden =
+      !state.activeRun;
+
+    $("active-run-id").textContent =
+      state.activeRun;
+
+    $("active-run-objective").textContent =
+      data.request?.objective ||
+      state.project.request?.objective ||
+      "";
+
+    $("run-status").textContent =
+      translated(
+        `status.${r?.status}`,
+        r?.status || "Loading…"
+      );
+
+    $("run-status").dataset.status =
+      r?.status || "unknown";
+
+    $("run-progress").hidden =
+      !ACTIVE.has(r?.status);
+
+    $("run-updated-at").textContent =
+      date(r?.updated_at);
+
+    details(
+      "active-run-settings",
+      [
+        ["settings.provider", data.request?.provider],
+        ["settings.model", data.request?.model],
+        ["settings.responseLanguage", data.request?.language],
+        ["dataset.id", data.request?.dataset_id],
+      ]
+    );
+
+    const plan = data.execution_plan;
+
+    $("plan-panel").hidden = !plan;
+
+    $("plan-json").textContent =
+      plan ? pretty(plan) : "";
+
+    details(
+      "plan-summary",
+      plan
+        ? [
+            ["plan.target", plan.target_column],
+            ["plan.metric", plan.primary_metric],
+            ["plan.split", plan.split?.strategy],
+            [
+              "plan.candidateModels",
+              plan.candidate_models?.join(", "),
+            ],
+          ]
+        : []
+    );
+
+    const completedStages = report
+      ? 3
+      : data.training_decision
+        ? 2
+        : plan
+          ? 1
+          : 0;
+
+    const agents = [
+      "planner",
+      "engineering",
+      "training",
+    ];
+
+    for (
+      const [i, agent] of agents.entries()
+    ) {
+      const status =
+        i < completedStages
+          ? "completed"
+          : i === completedStages
+            ? r?.status || "waiting"
+            : "waiting";
+
+      $(`${agent}-step`).dataset.status =
+        status;
+
+      $(`${agent}-status`).textContent =
+        translated(
+          `status.${status}`,
+          status
+        );
+    }
+
+    $("run-error-panel").hidden =
+      ![
+        "failed",
+        "interrupted",
+        "rejected",
+        "needs_review",
+      ].includes(r?.status);
+
+    $("run-error-message").textContent =
+      asText(r?.error || r?.status);
+
+    $("training-results-panel").hidden =
+      !report;
+
+    $("training-report-json").textContent =
+      report ? pretty(report) : "";
+
+    details(
+      "training-summary",
+      report
+        ? [
+            [
+              "training.selectedModel",
+              report.selected_model,
+            ],
+            [
+              "training.primaryMetric",
+              report.primary_metric,
+            ],
+            [
+              "training.selectedScore",
+              report.selected_validation_score,
+            ],
+            [
+              "training.trainRows",
+              report.split_counts?.train,
+            ],
+            [
+              "training.validationRows",
+              report.split_counts?.validation,
+            ],
+            [
+              "training.testRows",
+              report.split_counts?.test,
+            ],
+          ]
+        : []
+    );
+
+    const fragment =
+      document.createDocumentFragment();
+
+    for (
+      const candidate of report?.candidates || []
+    ) {
+      const clone =
+        $("model-row-template")
+          .content.cloneNode(true);
+
+      clone.querySelector(
+        '[data-field="model"]'
+      ).textContent =
+        asText(candidate.model);
+
+      clone.querySelector(
+        '[data-field="status"]'
+      ).textContent =
+        candidate.eligible_for_selection
+          ? "Eligible"
+          : "Ineligible";
+
+      clone.querySelector(
+        '[data-field="primary_score"]'
+      ).textContent =
+        number(candidate.validation_score);
+
+      clone.querySelector(
+        '[data-field="notes"]'
+      ).textContent =
+        (
+          candidate.warning_types || []
+        ).join(", ");
+
+      fragment.append(clone);
+    }
+
+    $("model-table-body").replaceChildren(
+      fragment
+    );
+
+    details(
+      "artifact-summary",
+      data.artifact
+        ? [
+            [
+              "artifact.id",
+              data.artifact.artifact_id,
+            ],
+            [
+              "artifact.status",
+              data.artifact.status,
+            ],
+            [
+              "artifact.files",
+              Object.keys(
+                data.artifact.files || {}
+              ).join("\n"),
+            ],
+          ]
+        : []
+    );
+
+    sync();
+  }
+
+  // ==========================================================
+  // HANDLE RUN RESPONSE
+  // ==========================================================
+
+  function acceptRun(
+    value,
+    skipReview = false
+  ) {
+    if (
+      !validId(value?.run_id) ||
+      value.run_id.toLowerCase() !== state.activeRun ||
+      !isObject(value.state) ||
+      !Array.isArray(value.interrupts)
+    ) {
+      throw new Error(
+        "Invalid run response."
+      );
+    }
+
+    if (
+      !skipReview &&
+      review?.render(value) === false
+    ) {
+      return;
+    }
+
+    state.run = value;
+
+    rememberRun(value);
+    renderRun();
+    schedulePoll();
+  }
+
+  async function selectRun(
+    id,
+    initial = null
+  ) {
+    if (!validId(id)) return;
+
+    state.activeRun =
+      id.toLowerCase();
+
+    state.run = null;
+
+    clearTimeout(pollTimer);
+
+    review?.clear();
+
+    renderRun();
+
+    if (initial) {
+      acceptRun(initial);
+    } else {
+      await loadRun();
+    }
+
+    $("run-panel").focus({
+      preventScroll: true,
+    });
+  }
+
+  async function loadRun() {
+    if (
+      !state.ready ||
+      !state.activeRun ||
+      pollBusy ||
+      state.reviewing
+    ) {
+      return;
+    }
+
+    const id = state.activeRun;
+
+    pollBusy = true;
+
+    try {
+      const result =
+        await api.getRun(id);
+
+      if (
+        state.alive &&
+        state.activeRun === id
+      ) {
+        acceptRun(result);
+      }
+
+    } catch (error) {
+      showError(error);
+
+    } finally {
+      pollBusy = false;
+      schedulePoll();
+    }
+  }
+
+  // ==========================================================
+  // RUN POLLING
+  // ==========================================================
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+
+    if (
+      !state.alive ||
+      !state.ready ||
+      !state.activeRun ||
+      document.hidden
+    ) {
+      return;
+    }
+
+    const status =
+      state.run?.status;
+
+    if (
+      !ACTIVE.has(status) &&
+      !WAITING.has(status)
+    ) {
+      return;
+    }
+
+    pollTimer = setTimeout(
+      () => void loadRun(),
+      WAITING.has(status) ? 10000 : 3000
+    );
+  }
+
+  // ==========================================================
+  // STEP 3: CONTINUE TO DATA ENGINEERING AND TRAINING
+  // ==========================================================
+
+  async function continueTraining() {
+    const p = state.project;
+
+    if (
+      !state.ready ||
+      !p.result?.blueprint ||
+      !state.dataset ||
+      state.creatingRun ||
+      state.pendingRun
+    ) {
+      return;
+    }
+
+    /*
+     * Current backend integration:
+     * Start a dataset-backed run with the same ML objective.
+     *
+     * The separate blueprint has NOT yet been attached
+     * to the dataset-backed execution record.
+     */
+
+    const request = {
+      request_id: createRequestId(),
+      dataset_id: state.selectedDataset,
+      objective: p.request.objective,
+    };
+
+    if (p.request.provider) {
+      request.provider = p.request.provider;
+    }
+
+    if (p.request.language) {
+      request.language = p.request.language;
+    }
+
+    state.pendingRun = request;
+    state.creatingRun = true;
+
+    notice("project-plan-error");
+
+    notice(
+      "project-plan-status",
+      "Starting dataset-backed Data Engineering and Training run…"
+    );
+
+    sync();
+
+    try {
+      const result =
+        await api.createRun(request);
+
+      if (!state.alive) return;
+
+      state.pendingRun = null;
+
+      p.executionId =
+        request.request_id;
+
+      await selectRun(
+        request.request_id,
+        result
+      );
+
+      notice(
+        "project-plan-status",
+        "Execution started. Follow agent progress and approve cleaning before training."
+      );
+
+    } catch (error) {
+      if (!error.outcomeUnknown) {
+        state.pendingRun = null;
+      }
+
+      notice(
+        "project-plan-error",
+        error.message
+      );
+
+      notice(
+        "project-plan-status",
+        error.outcomeUnknown
+          ? `Execution request may have succeeded. Do not click again. Run ID: ${request.request_id}. Refresh the run list.`
+          : "Could not start execution. Check the error."
+      );
+
+    } finally {
+      state.creatingRun = false;
+      sync();
+    }
+  }
+
+  // ==========================================================
+  // RETRY FAILED RUN
+  // ==========================================================
 
   async function retryRun() {
     if (
-      !state.ready ||
-      !state.record ||
-      !RETRYABLE.has(state.record.status) ||
-      state.retrying ||
-      review.busy ||
-      uncertainRetries.has(state.activeId) ||
-      Date.now() < state.retryAt
+      !state.activeRun ||
+      !RETRYABLE.has(state.run?.status) ||
+      state.retrying
     ) {
       return;
     }
 
-    const id = state.activeId;
-    const selection = state.selection;
-    const previous = pretty(state.record);
+    const id = state.activeRun;
 
     state.retrying = true;
-
-    cancelRead("run");
-    clearTimeout(pollTimer);
-
-    syncControls();
-
-    let posted = false;
+    sync();
 
     try {
-      const latest = validateRun(
-        await api.getRun(id),
-        id,
-      );
+      const current =
+        await api.getRun(id);
 
       if (
-        !state.alive ||
-        selection !== state.selection
+        id !== state.activeRun ||
+        !RETRYABLE.has(current.status)
       ) {
         return;
       }
 
-      acceptRun(latest);
-
-      // Recheck the exact displayed state before retrying.
-      if (
-        !RETRYABLE.has(latest.status) ||
-        pretty(latest) !== previous
-      ) {
-        message("app-message", "run.statusStale");
-        return;
-      }
-
-      posted = true;
-
-      message("app-message", "run.retrying");
-
-      const value = validateRun(
-        await api.retryRun(id),
-        id,
+      acceptRun(
+        await api.retryRun(id)
       );
 
-      if (!state.alive) return;
-
-      mergeRuns([value]);
-
-      if (selection === state.selection) {
-        acceptRun(value);
-        message("app-message", "run.retryAccepted");
-      }
     } catch (error) {
-      if (!state.alive) return;
+      showError(error);
 
-      cooldown(error);
-
-      if (
-        posted &&
-        (
-          error.outcomeUnknown ||
-          error.code === "invalid_response" ||
-          !(error instanceof ApiError)
-        )
-      ) {
-        uncertainRetries.add(id);
-
-        if (selection === state.selection) {
-          message("app-message", "run.retryUnknown");
-          paintRun();
-        }
-      } else if (selection === state.selection) {
-        appError(error);
-      }
     } finally {
       state.retrying = false;
-
-      if (state.alive) {
-        syncControls();
-        schedulePoll();
-      }
+      sync();
     }
   }
 
-  function download(kind) {
-    const value =
-      state.record?.state?.[
-        kind === "report"
-          ? "training_report"
-          : "artifact"
-      ];
+  // ==========================================================
+  // DOWNLOAD RESULTS
+  // ==========================================================
 
-    if (!value || !state.activeId) return;
+  function downloadJSON(kind) {
+    const data =
+      kind === "report"
+        ? state.run?.state?.training_report
+        : state.run?.state?.artifact;
 
-    let url;
-    const anchor = document.createElement("a");
+    if (
+      !data ||
+      !state.activeRun
+    ) {
+      return;
+    }
 
-    try {
-      url = URL.createObjectURL(
+    const url =
+      URL.createObjectURL(
         new Blob(
-          [pretty(value) + "\n"],
-          { type: "application/json;charset=utf-8" },
-        ),
+          [pretty(data)],
+          {
+            type: "application/json;charset=utf-8",
+          }
+        )
       );
 
-      anchor.href = url;
-      anchor.download =
-        `autoaudit-${state.activeId}-${kind}.json`;
+    const a =
+      document.createElement("a");
 
-      anchor.hidden = true;
+    a.href = url;
 
-      document.body.append(anchor);
-      anchor.click();
+    a.download =
+      `autoaudit-${state.activeRun}-${kind}.json`;
 
-      downloads.set(
-        url,
-        setTimeout(() => {
-          URL.revokeObjectURL(url);
-          downloads.delete(url);
-        }, 60_000),
-      );
-    } catch {
-      if (url) {
-        URL.revokeObjectURL(url);
-      }
+    document.body.append(a);
 
-      message(
-        "app-error-message",
-        "errors.download_failed",
-      );
-    } finally {
-      anchor.remove();
-    }
+    a.click();
+    a.remove();
+
+    setTimeout(
+      () => URL.revokeObjectURL(url),
+      10000
+    );
   }
+
+  // ==========================================================
+  // NEW PROJECT
+  // ==========================================================
+
+  function resetProject() {
+    if (
+      state.creatingRun ||
+      state.project.busy
+    ) {
+      return;
+    }
+
+    state.project = {
+      id: "",
+      request: null,
+      result: null,
+      executionId: "",
+      progress: null,
+      busy: false,
+      refreshing: false,
+      uncertain: false,
+    };
+
+    state.activeRun = "";
+    state.run = null;
+    state.pendingRun = null;
+
+    review?.clear();
+
+    clearTimeout(pollTimer);
+
+    $("project-plan-form").reset();
+
+    $("project-plan-status").textContent = "";
+
+    notice("project-plan-error");
+    notice("app-error-message");
+
+    renderProject();
+    renderRun();
+    renderHistory();
+
+    $("project-goal").focus();
+  }
+
+  // ==========================================================
+  // BACKEND CONNECTION
+  // ==========================================================
 
   async function connect() {
-    if (!state.alive || state.connecting) return;
+    if (
+      !state.alive ||
+      state.connecting
+    ) {
+      return;
+    }
 
     state.connecting = true;
-    state.connection = "checking";
-
-    message("app-error-message");
-    syncControls();
+    sync();
 
     try {
-      const result = await api.getReadiness();
+      const response =
+        await api.getReadiness();
 
-      if (!state.alive) return;
-
-      if (result.status !== "ready") {
-        throw new ApiError("Services are not ready.", {
-          code: "not_ready",
-        });
+      if (response?.status !== "ready") {
+        throw new Error(
+          "Backend is not ready."
+        );
       }
 
       state.ready = true;
-      state.connection = "ready";
 
-      syncControls();
+      notice("app-error-message");
+
+      sync();
 
       await Promise.allSettled([
         loadHistory(),
         loadDatasets(),
-        state.activeId
-          ? refreshRun()
-          : Promise.resolve(),
       ]);
+
+      if (state.activeRun) {
+        await loadRun();
+      }
+
     } catch (error) {
-      if (!state.alive) return;
-
       state.ready = false;
+      showError(error);
 
-      state.connection =
-        error.code === "not_ready"
-          ? "not_ready"
-          : "offline";
-
-      appError(error);
     } finally {
       state.connecting = false;
-
-      if (state.alive) {
-        syncControls();
-        schedulePoll();
-      }
+      sync();
+      schedulePoll();
     }
   }
 
+  // ==========================================================
+  // REPAINT UI
+  // ==========================================================
+
   function repaint() {
-    if (!state.alive) return;
-
-    messages.forEach((_, id) => {
-      paintMessage(id);
-    });
-
-    paintDatasetOptions();
-    paintDataset();
-    paintHistory();
-    paintRun();
-    countObjective();
-    syncControls();
+    renderDatasets();
+    renderHistory();
+    renderProject();
+    renderRun();
+    sync();
   }
 
+  // ==========================================================
+  // START APPLICATION
+  // ==========================================================
+
   async function start() {
-    if (state.started || !state.alive) return;
+    // Main workflow
+
+    listen(
+      "project-plan-form",
+      "submit",
+      createProject
+    );
+
+    listen(
+      "refresh-project-plan-button",
+      "click",
+      refreshProject
+    );
+
+    listen(
+      "refresh-project-progress-button",
+      "click",
+      refreshProjectProgress
+    );
+
+    listen(
+      "continue-training-button",
+      "click",
+      continueTraining
+    );
+
+    listen(
+      "new-run-button",
+      "click",
+      resetProject
+    );
+
+    // Dataset
+
+    listen(
+      "upload-form",
+      "submit",
+      uploadDataset
+    );
+
+    listen(
+      "dataset-select",
+      "change",
+      (event) =>
+        chooseDataset(event.target.value)
+    );
+
+    listen(
+      "dataset-profile-panel",
+      "toggle",
+      loadProfile
+    );
+
+    // Run history
+
+    listen(
+      "refresh-runs-button",
+      "click",
+      loadHistory
+    );
+
+    listen(
+      "refresh-run-button",
+      "click",
+      loadRun
+    );
+
+    listen(
+      "retry-run-button",
+      "click",
+      retryRun
+    );
+
+    listen(
+      "retry-connection-button",
+      "click",
+      connect
+    );
+
+    // Downloads
+
+    listen(
+      "download-report-button",
+      "click",
+      () => downloadJSON("report")
+    );
+
+    listen(
+      "download-manifest-button",
+      "click",
+      () => downloadJSON("manifest")
+    );
+
+    // Select previous run
+
+    listen(
+      "run-list",
+      "click",
+      (event) => {
+        const button =
+          event.target.closest(
+            "button[data-run-id]"
+          );
+
+        if (button) {
+          selectRun(
+            button.dataset.runId
+          );
+        }
+      }
+    );
+
+    // Hidden compatibility form
+
+    listen(
+      "run-form",
+      "submit",
+      (event) => event.preventDefault()
+    );
+
+    // Language
+
+    listen(
+      "interface-language",
+      "change",
+      async (event) => {
+        try {
+          await setLanguage(
+            event.target.value
+          );
+
+        } catch (error) {
+          event.target.value =
+            getLanguage();
+
+          showError(error);
+        }
+      }
+    );
+
+    // Browser events
+
+    listen(
+      document,
+      "visibilitychange",
+      () => {
+        if (document.hidden) {
+          clearTimeout(pollTimer);
+        } else {
+          void loadRun();
+        }
+      }
+    );
+
+    listen(
+      window,
+      "online",
+      connect
+    );
+
+    listen(
+      window,
+      "pagehide",
+      (event) => {
+        if (!event.persisted) {
+          destroy();
+        }
+      }
+    );
+
+    // Initialize interface translations
 
     const locale = await initI18n();
 
     if (!state.alive) return;
 
-    state.started = true;
+    // Human-in-the-loop controller
 
-    review = createReviewController({
+    review = reviewModule.createReviewController({
       onRunUpdate(value) {
         if (
           state.alive &&
-          value.run_id.toLowerCase() === state.activeId
+          value?.run_id?.toLowerCase() ===
+            state.activeRun
         ) {
           acceptRun(value, true);
         }
       },
 
-      onBusyChange(busy) {
-        if (!state.alive) return;
+      onBusyChange(value) {
+        state.reviewing = value;
 
-        if (busy) {
-          cancelRead("run");
+        if (value) {
           clearTimeout(pollTimer);
-        }
-
-        syncControls();
-
-        if (!busy) {
+        } else {
           schedulePoll();
         }
+
+        sync();
       },
     });
 
-    voice = createVoiceController({
-      onBusyChange: syncControls,
-    });
+    // Optional voice controller
 
-    bind(
-      $("new-run-button"),
-      "click",
-      newRun,
-    );
+    if (voiceModule?.createVoiceController) {
+      try {
+        voice =
+          voiceModule.createVoiceController({
+            onBusyChange: sync,
+          });
 
-    bind(
-      $("refresh-runs-button"),
-      "click",
-      loadHistory,
-    );
-
-    bind(
-      $("retry-connection-button"),
-      "click",
-      connect,
-    );
-
-    bind(
-      $("upload-form"),
-      "submit",
-      upload,
-    );
-
-    bind($("dataset-select"), "change", () => {
-      if (
-        !state.pending &&
-        !state.uploading &&
-        !state.creating
-      ) {
-        return chooseDataset(
-          $("dataset-select").value,
+      } catch (error) {
+        console.warn(
+          "Voice unavailable:",
+          error
         );
       }
-    });
+    }
 
-    bind(
-      $("dataset-profile-panel"),
-      "toggle",
-      loadProfile,
-    );
-
-    bind(
-      $("run-form"),
-      "submit",
-      submitRun,
-    );
-
-    bind($("objective"), "input", () => {
-      countObjective();
-
-      $("objective").removeAttribute("aria-invalid");
-
-      if (!state.pending) {
-        message("run-form-error");
-      }
-    });
-
-    bind($("interface-language"), "change", async () => {
-      const requested = $("interface-language").value;
-
-      try {
-        await setLanguage(requested);
-      } catch (error) {
-        $("interface-language").value = getLanguage();
-        appError(error);
-      }
-    });
-
-    bind($("run-list"), "click", (event) => {
-      const button = event.target.closest(
-        "button[data-run-id]",
-      );
-
-      if (
-        button &&
-        $("run-list").contains(button)
-      ) {
-        selectRun(button.dataset.runId);
-      }
-    });
-
-    bind(
-      $("refresh-run-button"),
-      "click",
-      refreshRun,
-    );
-
-    bind(
-      $("retry-run-button"),
-      "click",
-      retryRun,
-    );
-
-    bind(
-      checkCreate,
-      "click",
-      checkPending,
-    );
-
-    bind(resendCreate, "click", () => {
-      if (state.pending?.mode === "missing") {
-        return postCreate();
-      }
-    });
-
-    bind($("download-report-button"), "click", () => {
-      download("report");
-    });
-
-    bind($("download-manifest-button"), "click", () => {
-      download("manifest");
-    });
-
-    bind(document, "visibilitychange", () => {
-      if (document.hidden) {
-        clearTimeout(pollTimer);
-        cancelRead("run");
-      } else if (state.ready) {
-        return loadRun();
-      }
-    });
-
-    bind(globalThis, "online", connect);
-
-    bind(globalThis, "pagehide", (event) => {
-      clearTimeout(pollTimer);
-
-      for (const name of [...reads.keys()]) {
-        cancelRead(name);
-      }
-
-      if (!event.persisted) {
-        destroy();
-      }
-    });
-
-    bind(globalThis, "pageshow", (event) => {
-      if (event.persisted) {
-        return connect();
-      }
-    });
-
-    unsubscribe = onLanguageChange(repaint);
+    removeLanguageListener =
+      onLanguageChange(repaint);
 
     repaint();
+
     await connect();
 
-    if (locale.error && state.alive) {
-      appError(locale.error);
+    if (locale?.error) {
+      console.warn(
+        "Language pack fallback:",
+        locale.error
+      );
     }
   }
+
+  // ==========================================================
+  // CLEANUP
+  // ==========================================================
 
   function destroy() {
     if (!state.alive) return;
@@ -2165,82 +2044,31 @@ export function createApp() {
     state.alive = false;
 
     clearTimeout(pollTimer);
-    clearTimeout(cooldownTimer);
 
-    for (const name of [...reads.keys()]) {
-      cancelRead(name);
-    }
+    signals.abort();
 
-    bindings.abort();
+    review?.destroy?.();
+    voice?.destroy?.();
 
-    voice?.destroy();
-    review?.destroy();
-
-    unsubscribe();
-    recovery.remove();
-
-    $("upload-form").noValidate =
-      originalValidation[0];
-
-    $("run-form").noValidate =
-      originalValidation[1];
-
-    for (const [url, timer] of downloads) {
-      clearTimeout(timer);
-      URL.revokeObjectURL(url);
-    }
-
-    downloads.clear();
-
-    // Submitted POST requests may still finish on the server.
+    removeLanguageListener();
   }
 
-  return Object.freeze({
+  return {
     start,
     destroy,
-  });
+  };
 }
 
-function boot() {
-  let application;
-
-  try {
-    application = createApp();
-    application.start().catch(fail);
-  } catch (error) {
-    fail(error);
-  }
-
-  function fail(error) {
-    application?.destroy();
-
-    const panel = document.getElementById("app-error");
-
-    const message = document.getElementById(
-      "app-error-message",
-    );
-
-    if (panel && message) {
-      panel.hidden = false;
-      message.hidden = false;
-
-      message.textContent =
-        "AutoAudit could not start. Check the browser console and saved frontend files, then reload.";
-    }
-
-    console.error(
-      "AutoAudit frontend initialization failed.",
-      error,
-    );
-  }
-}
+// ============================================================
+// BOOTSTRAP
+// ============================================================
 
 if (document.readyState === "loading") {
   document.addEventListener(
     "DOMContentLoaded",
-    boot,
-    { once: true },
+    () => void boot(),
+    { once: true }
   );
 } else {
-  boot();
+  void boot();
 }

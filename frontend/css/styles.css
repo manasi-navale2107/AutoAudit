@@ -1,13 +1,11 @@
-/* AutoAudit: shared theme and document defaults */
+
+/* AutoAudit — Complete Frontend Stylesheet */
 
 :root {
   color-scheme: light;
-
-  --font-sans: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont,
+  --font-sans: "Segoe UI", system-ui, -apple-system,
     "Nirmala UI", "Noto Sans Devanagari", sans-serif;
-
-  --font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono",
-    "Nirmala UI", monospace;
+  --font-mono: Consolas, "Liberation Mono", monospace;
 
   --page: #f3f6fa;
   --surface: #ffffff;
@@ -20,20 +18,16 @@
 
   --accent: #0b6b61;
   --accent-hover: #08564e;
-
   --success: #146747;
   --success-bg: #eaf7ef;
-
   --info: #2459a4;
   --info-bg: #edf4ff;
-
   --warning: #825007;
   --warning-bg: #fff7e6;
-
   --danger: #a42625;
   --danger-bg: #fff0ef;
-
   --focus: #2563eb;
+
   --radius: 0.875rem;
   --shadow: 0 8px 28px rgb(20 34 56 / 5%);
 
@@ -61,28 +55,15 @@ body {
   overflow-wrap: anywhere;
 }
 
-h1,
-h2,
-h3,
-h4,
-p,
-dl,
-dd {
+h1, h2, h3, h4, p, dl, dd {
   margin: 0;
 }
 
-button,
-input,
-select,
-textarea {
+button, input, select, textarea {
   font: inherit;
 }
 
-button,
-input,
-select,
-textarea,
-fieldset {
+button, input, select, textarea, fieldset {
   min-inline-size: 0;
 }
 
@@ -108,7 +89,6 @@ h3 {
 
 h4 {
   font-size: 1rem;
-  line-height: 1.6;
 }
 
 code {
@@ -121,8 +101,6 @@ code {
   outline: 3px solid var(--focus);
   outline-offset: 3px;
 }
-
-/* Never override the HTML hidden attribute with component display rules. */
 
 [hidden] {
   display: none !important;
@@ -186,7 +164,9 @@ code {
   transform: translateY(0);
 }
 
-/* Workspace and run history */
+/* =========================
+   Main Layout
+   ========================= */
 
 .app-shell {
   display: grid;
@@ -196,7 +176,6 @@ code {
 
 .sidebar {
   --focus: #7de4df;
-
   position: sticky;
   inset-block-start: 0;
   display: flex;
@@ -226,12 +205,10 @@ code {
   border-radius: 0.625rem;
   color: var(--navy);
   background: #a9eee0;
-  font-size: 1rem;
   font-weight: 800;
 }
 
 .brand-name {
-  min-inline-size: 0;
   font-size: 1.375rem;
   font-weight: 700;
 }
@@ -264,8 +241,11 @@ code {
 
 .sidebar-footer a {
   color: #dce7f8;
-  font-size: 0.875rem;
 }
+
+/* =========================
+   Run History
+   ========================= */
 
 .run-list {
   display: grid;
@@ -305,7 +285,6 @@ code {
 }
 
 .run-list-title {
-  font-size: 0.9375rem;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
@@ -314,8 +293,11 @@ code {
 .run-list-time {
   color: #c8d6e8;
   font-size: 0.8125rem;
-  overflow-wrap: anywhere;
 }
+
+/* =========================
+   Workspace
+   ========================= */
 
 .workspace {
   inline-size: 100%;
@@ -339,7 +321,6 @@ code {
   align-items: center;
   flex-wrap: wrap;
   gap: 1rem;
-  min-inline-size: 0;
 }
 
 .section-heading,
@@ -384,11 +365,9 @@ code {
   border-inline-start: 1px solid var(--line);
 }
 
-.setup-section > .field {
-  margin-block-start: 1.25rem;
-}
-
-/* Forms and actions */
+/* =========================
+   Forms and Inputs
+   ========================= */
 
 form {
   min-inline-size: 0;
@@ -481,7 +460,6 @@ textarea[aria-invalid="true"] {
 
 input[type="file"] {
   padding: 0.375rem;
-  font-size: 0.875rem;
 }
 
 input[type="file"]::file-selector-button {
@@ -495,17 +473,10 @@ input[type="file"]::file-selector-button {
   cursor: pointer;
 }
 
-input[type="file"]:disabled::file-selector-button {
-  color: #52637a;
-  background: #dce4ee;
-  cursor: not-allowed;
-}
-
 .character-count {
   color: var(--muted);
   font-size: 0.8125rem;
   text-align: end;
-  font-variant-numeric: tabular-nums;
 }
 
 .review-hint {
@@ -515,6 +486,10 @@ input[type="file"]:disabled::file-selector-button {
   background: #edf8f4;
   font-size: 0.875rem;
 }
+
+/* =========================
+   Buttons
+   ========================= */
 
 .action-row {
   display: flex;
@@ -537,10 +512,8 @@ input[type="file"]:disabled::file-selector-button {
   font-weight: 600;
   line-height: 1.6;
   text-align: center;
-  white-space: normal;
-  overflow-wrap: anywhere;
   cursor: pointer;
-  transition: background-color 140ms ease, border-color 140ms ease;
+  transition: background-color 140ms ease;
 }
 
 fieldset > .button {
@@ -572,7 +545,6 @@ fieldset > .button {
 }
 
 .button--quiet:hover:not(:disabled) {
-  border-color: var(--line);
   background: #edf2f8;
 }
 
@@ -591,7 +563,6 @@ fieldset > .button {
 }
 
 .sidebar .button--quiet:hover:not(:disabled) {
-  border-color: #546a86;
   background: #263e59;
 }
 
@@ -618,7 +589,9 @@ fieldset > .button {
   background: var(--danger-bg);
 }
 
-/* Dataset metadata, explanations, and human review */
+/* =========================
+   Dataset and Statistics
+   ========================= */
 
 .dataset-summary {
   margin-block-start: 1.5rem;
@@ -634,11 +607,11 @@ fieldset > .button {
 }
 
 .stat-grid {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
 }
 
 .definition-grid {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
 }
 
 .stat-grid > div,
@@ -662,7 +635,6 @@ fieldset > .button {
 .definition-grid dt {
   color: var(--muted);
   font-size: 0.875rem;
-  overflow-wrap: anywhere;
 }
 
 .stat-grid dd,
@@ -674,7 +646,6 @@ fieldset > .button {
 
 .stat-grid dd {
   font-size: 1.25rem;
-  font-variant-numeric: tabular-nums;
 }
 
 .result-section {
@@ -682,6 +653,10 @@ fieldset > .button {
   padding-block-start: 1.5rem;
   border-block-start: 1px solid var(--line);
 }
+
+/* =========================
+   Human Review
+   ========================= */
 
 .review-panel {
   margin-block-start: 1.5rem;
@@ -726,7 +701,6 @@ fieldset > .button {
 .updated-at {
   color: var(--muted);
   font-size: 0.875rem;
-  overflow-wrap: anywhere;
 }
 
 .run-reference {
@@ -737,6 +711,10 @@ fieldset > .button {
   margin-block-start: 1.5rem;
 }
 
+/* =========================
+   JSON Preview
+   ========================= */
+
 details {
   margin-block-start: 1rem;
   padding: 0.875rem 1rem;
@@ -746,15 +724,9 @@ details {
 }
 
 summary {
-  min-block-size: 1.75rem;
   font-size: 0.875rem;
   font-weight: 600;
   cursor: pointer;
-  overflow-wrap: anywhere;
-}
-
-summary::marker {
-  color: var(--accent);
 }
 
 .json-view {
@@ -774,17 +746,17 @@ summary::marker {
   tab-size: 2;
 }
 
-/* Tables scroll inside their own region. */
+/* =========================
+   Data Tables
+   ========================= */
 
 .table-scroll {
   max-inline-size: 100%;
   max-block-size: 34rem;
   margin-block: 1rem;
   overflow: auto;
-  overscroll-behavior-inline: contain;
   border: 1px solid var(--line);
   border-radius: 0.625rem;
-  background: var(--surface);
 }
 
 .data-table {
@@ -793,13 +765,11 @@ summary::marker {
   border-collapse: separate;
   border-spacing: 0;
   font-size: 0.875rem;
-  line-height: 1.6;
 }
 
 .data-table caption {
   padding: 0.875rem 1rem;
   color: var(--muted);
-  background: var(--surface);
   text-align: start;
   font-weight: 600;
 }
@@ -817,14 +787,11 @@ summary::marker {
   position: sticky;
   inset-block-start: 0;
   z-index: 1;
-  color: #41536d;
   background: #eef3f9;
-  font-weight: 600;
 }
 
 .data-table th[scope="row"] {
   min-inline-size: 7rem;
-  font-weight: 600;
 }
 
 .data-table td[data-field="reason"],
@@ -840,11 +807,9 @@ summary::marker {
   background: #f4f8fc;
 }
 
-.data-table tbody tr[data-selected="true"] > * {
-  background: var(--success-bg);
-}
-
-/* JavaScript supplies status values. Color always accompanies text. */
+/* =========================
+   Status Badges
+   ========================= */
 
 .badge {
   display: inline-flex;
@@ -857,8 +822,6 @@ summary::marker {
   background: #eef2f7;
   font-size: 0.875rem;
   font-weight: 600;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
 }
 
 .badge[data-state="ready"],
@@ -881,7 +844,6 @@ summary::marker {
 .badge[data-status="needs_review"],
 .badge[data-status="interrupted"] {
   color: var(--warning);
-  border-color: #e7c88d;
   background: var(--warning-bg);
 }
 
@@ -889,9 +851,12 @@ summary::marker {
 .badge[data-state="not_ready"],
 .badge[data-status="failed"] {
   color: var(--danger);
-  border-color: #e8b5b1;
   background: var(--danger-bg);
 }
+
+/* =========================
+   Agent Progress
+   ========================= */
 
 .agent-steps {
   display: grid;
@@ -920,14 +885,12 @@ summary::marker {
 
 .agent-steps h3 {
   font-size: 1rem;
-  overflow-wrap: anywhere;
 }
 
 .agent-steps p {
   margin-block-start: 0.25rem;
   color: var(--muted);
   font-size: 0.875rem;
-  overflow-wrap: anywhere;
 }
 
 .step-number {
@@ -936,11 +899,9 @@ summary::marker {
   flex: 0 0 2.25rem;
   block-size: 2.25rem;
   border-radius: 0.5rem;
-  color: #41536d;
   background: #e4ebf4;
   font-size: 0.875rem;
   font-weight: 700;
-  font-variant-numeric: tabular-nums;
 }
 
 .agent-steps > li[data-status="running"] {
@@ -969,7 +930,9 @@ summary::marker {
   background: var(--success);
 }
 
-/* Feedback and native progress indicators */
+/* =========================
+   Notices and Progress
+   ========================= */
 
 .notice {
   padding: 1rem 1.25rem;
@@ -1000,42 +963,148 @@ summary::marker {
   margin-block-end: 1.25rem;
 }
 
-.run-panel > .notice {
-  margin-block-start: 1.5rem;
-}
-
 progress {
   display: block;
   inline-size: 100%;
   block-size: 0.625rem;
   margin-block: 1rem;
-  overflow: hidden;
   border: 0;
   border-radius: 999px;
   accent-color: var(--accent);
 }
 
-progress[value] {
-  appearance: none;
-  background: #dfe7ef;
+/* ===========================================
+   NEW: Goal-Only Project Planning
+   =========================================== */
+
+#project-planning-panel {
+  border: 1px solid #b5d6d0;
+  background: linear-gradient(
+    145deg,
+    #ffffff 65%,
+    #f0faf7 100%
+  );
 }
 
-progress[value]::-webkit-progress-bar {
-  border-radius: 999px;
-  background: #dfe7ef;
+#project-plan-form {
+  display: grid;
+  gap: 1rem;
 }
 
-progress[value]::-webkit-progress-value {
-  border-radius: 999px;
-  background: var(--accent);
+#project-plan-fields {
+  display: grid;
+  gap: 1.15rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
 
-progress[value]::-moz-progress-bar {
-  border-radius: 999px;
-  background: var(--accent);
+#project-goal {
+  inline-size: 100%;
+  min-block-size: 9rem;
+  resize: vertical;
 }
 
-/* Responsive layout */
+#project-use-dataset {
+  inline-size: 1.1rem;
+  block-size: 1.1rem;
+  margin-inline-end: 0.5rem;
+  accent-color: var(--accent);
+  vertical-align: middle;
+}
+
+#project-plan-fields .form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+#create-project-plan-button {
+  justify-self: start;
+}
+
+#project-plan-error {
+  margin: 0;
+}
+
+#project-plan-status {
+  min-block-size: 1.5rem;
+}
+
+/* ===========================================
+   NEW: Master Blueprint Preview
+   =========================================== */
+
+#project-blueprint-panel {
+  border: 1px solid var(--line);
+}
+
+#project-blueprint-panel h3 {
+  margin-block: 1.35rem 0.75rem;
+}
+
+#project-blueprint-panel > p code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+#project-planned-file-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+  max-block-size: 23rem;
+  overflow: auto;
+}
+
+#project-planned-file-list > li {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--accent);
+  border-radius: 0.5rem;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+#project-file-progress {
+  inline-size: 100%;
+  block-size: 0.85rem;
+  accent-color: var(--accent);
+}
+
+#project-file-status,
+#project-dataset-status {
+  overflow-wrap: anywhere;
+}
+
+#project-blueprint-panel details {
+  min-inline-size: 0;
+  margin-block: 1rem;
+}
+
+#project-blueprint-json {
+  max-block-size: 28rem;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+}
+
+#project-blueprint-panel .action-row {
+  margin-block: 1rem;
+}
+
+#project-blueprint-panel .review-hint {
+  margin-block-start: 1.25rem;
+}
+
+/* =========================
+   Responsive Design
+   ========================= */
 
 @media (max-width: 70rem) {
   .setup-grid {
@@ -1072,13 +1141,11 @@ progress[value]::-moz-progress-bar {
 
   .sidebar > .section-heading,
   .sidebar nav,
-  .sidebar > .muted,
   .sidebar-footer {
     grid-column: 1 / -1;
   }
 
   .sidebar nav {
-    min-inline-size: 0;
     overflow: visible;
   }
 
@@ -1086,12 +1153,6 @@ progress[value]::-moz-progress-bar {
     grid-auto-flow: column;
     grid-auto-columns: minmax(12rem, 16rem);
     overflow-x: auto;
-    overscroll-behavior-inline: contain;
-  }
-
-  .sidebar-footer {
-    margin: 0;
-    padding-block-start: 0.75rem;
   }
 
   .workspace {
@@ -1104,38 +1165,32 @@ progress[value]::-moz-progress-bar {
     padding: 1rem;
   }
 
-  .workspace-header {
-    align-items: flex-start;
-  }
-
-  .header-controls {
-    inline-size: 100%;
-    align-items: flex-start;
-  }
-
-  .header-controls > .field {
-    flex: 1 1 12rem;
-  }
-
   .panel {
     padding: 1.125rem;
   }
 
+  .header-controls {
+    inline-size: 100%;
+  }
+
   .form-grid,
-  .agent-steps {
+  .agent-steps,
+  #project-plan-fields .form-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  #create-project-plan-button {
+    inline-size: 100%;
+    justify-self: stretch;
+  }
+
+  .action-row > .button,
+  #project-blueprint-panel .action-row > .button {
+    flex: 1 1 100%;
   }
 
   .review-panel {
     padding: 1rem;
-  }
-
-  .action-row > .button {
-    flex: 1 1 10rem;
-  }
-
-  .file-picker {
-    padding: 0.875rem;
   }
 }
 
@@ -1146,7 +1201,6 @@ progress[value]::-moz-progress-bar {
 
   .sidebar > .button {
     inline-size: 100%;
-    justify-self: stretch;
   }
 
   .run-list {
@@ -1159,7 +1213,9 @@ progress[value]::-moz-progress-bar {
   }
 }
 
-/* Accessibility preferences */
+/* =========================
+   Accessibility
+   ========================= */
 
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -1176,15 +1232,8 @@ progress[value]::-moz-progress-bar {
   .badge,
   .panel,
   .review-panel,
-  .agent-steps > li,
-  .run-list-button {
+  .agent-steps > li {
     border: 1px solid ButtonText;
-  }
-
-  .run-list-button[aria-current="true"],
-  .run-list-button[aria-current="page"] {
-    outline: 2px solid Highlight;
-    outline-offset: -3px;
   }
 
   :focus-visible {

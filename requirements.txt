@@ -78,3 +78,5 @@ httpx>=0.28.1,<1.0.0
 
 # Optional speech dependencies belong in requirements-voice.txt.
 # Browser audio recording uses frontend JavaScript.
+
+filelock

@@ -327,6 +327,82 @@ class DataEngineeringAgent:
             response.model_dump_json()
         )
 
+
+        # AUTOAUDIT_COVERAGE_FIX
+        # Restore only exclusions already required by the Planner.
+        expected = {
+            name for name in frame.columns
+            if name != execution_plan.target_column
+        }
+        # Target labels must never receive feature cleaning policies.
+        if any(
+            p.column == execution_plan.target_column
+            for p in proposal.policies
+        ):
+            repaired = proposal.model_dump(mode="json")
+            repaired["policies"] = [
+                item for item in repaired["policies"]
+                if item["column"] != execution_plan.target_column
+            ]
+            proposal = CleaningProposal.model_validate(repaired)
+            logger.info("Removed target-column cleaning policy.")
+
+        actual = {p.column for p in proposal.policies}
+
+        unexpected = actual - expected
+        if unexpected:
+            raise CleaningProposalError(
+                "Unexpected policy columns: "
+                + ", ".join(sorted(unexpected))
+            )
+
+        required_exclusions = {
+            e.column for e in execution_plan.feature_exclusions
+        }
+        omitted = (expected - actual) & required_exclusions
+
+        if omitted:
+            from app.schemas.cleaning import ColumnCleaningPolicy
+
+            kinds = {
+                c.name: c.kind for c in fresh_profile.columns
+            }
+
+            additions = [
+                ColumnCleaningPolicy(
+                    column=name,
+                    action="exclude",
+                    feature_kind=kinds[name],
+                    missing_strategy="none",
+                    fill_value=None,
+                    scaling="none",
+                    encoding="none",
+                    reason="Excluded by the validated Planner execution plan.",
+                )
+                for name in frame.columns
+                if name in omitted
+            ]
+
+            repaired = proposal.model_dump(mode="json")
+            repaired["policies"].extend(
+                p.model_dump(mode="json") for p in additions
+            )
+            proposal = CleaningProposal.model_validate(repaired)
+
+            logger.info(
+                "Restored %d Planner-required exclusions.",
+                len(additions),
+            )
+
+        remaining = expected - {
+            p.column for p in proposal.policies
+        }
+        if remaining:
+            raise CleaningProposalError(
+                "LLM omitted non-excluded columns: "
+                + ", ".join(sorted(remaining))
+            )
+
         validate_proposal_against_frame(
             proposal=proposal,
             execution_plan=execution_plan,

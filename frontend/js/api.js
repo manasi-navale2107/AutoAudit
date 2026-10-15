@@ -1,19 +1,30 @@
+
 /**
- * AutoAudit HTTP client.
+ * AutoAudit HTTP API Client
  *
- * Import this module from app.js / review.js.
- * Mutating requests are never retried automatically.
- * Preserve each createRun payload until its outcome is known.
+ * Supports:
+ * 1. Existing dataset upload and profiling
+ * 2. Existing three-agent ML training workflow
+ * 3. Human-in-the-loop approval and retries
+ * 4. Goal-only project blueprint generation
+ * 5. Project planning status and generated file progress
+ *
+ * The final project ZIP is NOT generated or exposed here.
  */
 
 export const MAX_CSV_BYTES = 25 * 1024 * 1024;
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const PLANNING_TIMEOUT_MS = 180_000;
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+
+// ============================================================
+// API ERROR
+// ============================================================
 
 export class ApiError extends Error {
   constructor(
@@ -38,6 +49,10 @@ export class ApiError extends Error {
   }
 }
 
+
+// ============================================================
+// REQUEST HELPERS
+// ============================================================
 
 export function isAbortError(error) {
   return (
@@ -91,20 +106,34 @@ function uuid(value, field) {
 }
 
 
-function textField(value, field, min, max, trim = true) {
+function textField(
+  value,
+  field,
+  min,
+  max,
+  trim = true,
+) {
   if (typeof value !== "string") {
-    throw inputError(`${field} must be text.`, field);
+    throw inputError(
+      `${field} must be text.`,
+      field,
+    );
   }
 
   const result = trim ? value.trim() : value;
 
-  // Count Unicode code points, matching Python's character limits.
   const length =
-    result.length > max * 2 ? Infinity : [...result].length;
+    result.length > max * 2
+      ? Infinity
+      : [...result].length;
 
-  if (!result.trim() || length < min || length > max) {
+  if (
+    !result.trim() ||
+    length < min ||
+    length > max
+  ) {
     throw inputError(
-      `${field} must contain ${min}–${max} characters.`,
+      `${field} must contain ${min}-${max} characters.`,
       field,
     );
   }
@@ -115,43 +144,52 @@ function textField(value, field, min, max, trim = true) {
 
 function checkFields(value, allowed) {
   if (!isRecord(value)) {
-    throw inputError("Provide a request object.");
+    throw inputError(
+      "Provide a valid request object.",
+    );
   }
 
-  const unsupported = Object.keys(value).some(
-    (key) => !allowed.includes(key),
-  );
+  const allowedFields = new Set(allowed);
 
-  if (unsupported) {
-    throw inputError(
-      "The request contains unsupported fields.",
-    );
+  for (const key of Object.keys(value)) {
+    if (!allowedFields.has(key)) {
+      throw inputError(
+        `Unexpected request field: ${key}`,
+        key,
+      );
+    }
   }
 }
 
 
-function runPayload(value) {
-  checkFields(value, [
-    "request_id",
-    "dataset_id",
-    "objective",
-    "target_column",
-    "provider",
-    "language",
-    "model",
-  ]);
+function providerField(value) {
+  if (
+    value !== "groq" &&
+    value !== "ollama"
+  ) {
+    throw inputError(
+      "Unsupported provider.",
+      "provider",
+    );
+  }
 
-  const body = {
-    request_id: uuid(value.request_id, "request_id"),
-    dataset_id: uuid(value.dataset_id, "dataset_id"),
-    objective: textField(
-      value.objective,
-      "objective",
-      5,
-      5000,
-    ),
-  };
+  return value;
+}
 
+
+function languageField(value) {
+  if (!["en", "mr", "hi"].includes(value)) {
+    throw inputError(
+      "Unsupported language.",
+      "language",
+    );
+  }
+
+  return value;
+}
+
+
+function optionalFields(value, body) {
   for (const key of [
     "target_column",
     "provider",
@@ -168,19 +206,11 @@ function runPayload(value) {
       continue;
     }
 
-    if (key === "provider" || key === "language") {
-      const allowed =
-        key === "provider"
-          ? ["groq", "ollama"]
-          : ["en", "mr", "hi"];
-
-      if (!allowed.includes(item)) {
-        throw inputError(`Unsupported ${key}.`, key);
-      }
-
-      body[key] = item;
+    if (key === "provider") {
+      body.provider = providerField(item);
+    } else if (key === "language") {
+      body.language = languageField(item);
     } else {
-      // Preserve spaces in actual CSV column names.
       body[key] = textField(
         item,
         key,
@@ -191,9 +221,102 @@ function runPayload(value) {
     }
   }
 
+  if (body.model && !body.provider) {
+    throw inputError(
+      "Select a provider when specifying a model.",
+      "provider",
+    );
+  }
+
   return body;
 }
 
+
+// ============================================================
+// EXISTING DATASET-BACKED RUN REQUEST
+// ============================================================
+
+function runPayload(value) {
+  checkFields(value, [
+    "request_id",
+    "dataset_id",
+    "objective",
+    "target_column",
+    "provider",
+    "language",
+    "model",
+  ]);
+
+  const body = {
+    request_id: uuid(
+      value.request_id,
+      "request_id",
+    ),
+
+    dataset_id: uuid(
+      value.dataset_id,
+      "dataset_id",
+    ),
+
+    objective: textField(
+      value.objective,
+      "objective",
+      5,
+      5000,
+    ),
+  };
+
+  return optionalFields(value, body);
+}
+
+
+// ============================================================
+// NEW: GOAL-ONLY PROJECT PLANNING REQUEST
+// ============================================================
+
+function projectPlanPayload(value) {
+  checkFields(value, [
+    "request_id",
+    "objective",
+    "dataset_id",
+    "target_column",
+    "provider",
+    "language",
+    "model",
+  ]);
+
+  const body = {
+    request_id: uuid(
+      value.request_id,
+      "request_id",
+    ),
+
+    objective: textField(
+      value.objective,
+      "objective",
+      5,
+      5000,
+    ),
+
+    dataset_id: (
+      value.dataset_id === undefined ||
+      value.dataset_id === null ||
+      value.dataset_id === ""
+    )
+      ? null
+      : uuid(
+          value.dataset_id,
+          "dataset_id",
+        ),
+  };
+
+  return optionalFields(value, body);
+}
+
+
+// ============================================================
+// HUMAN REVIEW REQUEST
+// ============================================================
 
 function reviewPayload(value) {
   checkFields(value, [
@@ -207,15 +330,18 @@ function reviewPayload(value) {
     value.revision < 1
   ) {
     throw inputError(
-      "Review the current proposal revision.",
+      "Review revision must be a positive integer.",
       "revision",
     );
   }
 
   if (
-    !["approve", "changes", "reject", "answer"].includes(
-      value.action,
-    )
+    ![
+      "approve",
+      "changes",
+      "reject",
+      "answer",
+    ].includes(value.action)
   ) {
     throw inputError(
       "Unsupported review action.",
@@ -245,7 +371,7 @@ function reviewPayload(value) {
     !body.feedback
   ) {
     throw inputError(
-      "Provide feedback or answers for this action.",
+      "Feedback is required.",
       "feedback",
     );
   }
@@ -255,7 +381,7 @@ function reviewPayload(value) {
     body.feedback !== undefined
   ) {
     throw inputError(
-      "Use Request changes when providing modifications.",
+      "Use Request Changes to modify a proposal.",
       "feedback",
     );
   }
@@ -271,7 +397,7 @@ function listLimit(value) {
     value > 100
   ) {
     throw inputError(
-      "limit must be an integer from 1 to 100.",
+      "Limit must be between 1 and 100.",
       "limit",
     );
   }
@@ -279,6 +405,10 @@ function listLimit(value) {
   return value;
 }
 
+
+// ============================================================
+// HTTP OPTIONS
+// ============================================================
 
 function requestOptions(
   options,
@@ -290,6 +420,10 @@ function requestOptions(
   };
 }
 
+
+// ============================================================
+// API URL
+// ============================================================
 
 function apiURL(path) {
   if (
@@ -304,28 +438,41 @@ function apiURL(path) {
   }
 
   const base =
-    globalThis.document?.body?.dataset?.apiBase ?? "/api";
+    globalThis.document?.body?.dataset?.apiBase ??
+    "/api";
 
-  const validBase =
-    typeof base === "string" &&
-    /^\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\/?$/.test(base);
-
-  if (!validBase) {
+  if (
+    typeof base !== "string" ||
+    !/^\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\/?$/.test(base)
+  ) {
     throw new ApiError(
       "The API base path is invalid.",
       { code: "invalid_api_base" },
     );
   }
 
+  const cleanBase = base.replace(/\/$/, "");
+
   return new URL(
-    `${base.replace(/\/$/, "")}/${path}`,
+    `${cleanBase}/${path}`,
     globalThis.location.origin,
   ).href;
 }
 
 
-function shortText(value, fallback, max = 600) {
-  return typeof value === "string" && value.trim()
+// ============================================================
+// ERROR RESPONSE HELPERS
+// ============================================================
+
+function shortText(
+  value,
+  fallback,
+  max = 600,
+) {
+  return (
+    typeof value === "string" &&
+    value.trim()
+  )
     ? value.trim().slice(0, max)
     : fallback;
 }
@@ -336,53 +483,71 @@ function retryDelay(response) {
     .get("retry-after")
     ?.trim();
 
-  if (!value) return null;
+  if (!value) {
+    return null;
+  }
 
   const milliseconds = /^\d+$/.test(value)
     ? Number(value) * 1000
     : Date.parse(value) - Date.now();
 
-  if (
-    !Number.isFinite(milliseconds) ||
-    Math.abs(milliseconds) > Number.MAX_SAFE_INTEGER
-  ) {
+  if (!Number.isFinite(milliseconds)) {
     return null;
   }
 
-  return Math.max(0, Math.ceil(milliseconds));
+  return Math.max(
+    0,
+    Math.ceil(milliseconds),
+  );
 }
 
 
 function httpError(response, data) {
   let code = `http_${response.status}`;
+
   let message =
     `The server returned HTTP ${response.status}.`;
 
   let issues = [];
 
-  const detail = isRecord(data) ? data.detail : null;
+  const detail = isRecord(data)
+    ? data.detail
+    : null;
 
   if (isRecord(detail)) {
-    code = shortText(detail.code, code, 80);
-    message = shortText(detail.message, message);
+    code = shortText(
+      detail.code,
+      code,
+      80,
+    );
+
+    message = shortText(
+      detail.message,
+      message,
+    );
   } else if (Array.isArray(detail)) {
     code = "validation_error";
-    message = "Check the request fields and try again.";
 
-    // Retain field locations/messages, not echoed input or context.
+    message =
+      "Check the request fields and try again.";
+
     issues = detail
       .filter(isRecord)
       .slice(0, 12)
       .map((item) => ({
         field: (
-          Array.isArray(item.loc) ? item.loc : []
+          Array.isArray(item.loc)
+            ? item.loc
+            : []
         )
           .filter(
             (part) =>
               typeof part === "string" ||
               Number.isInteger(part),
           )
-          .filter((part) => part !== "body")
+          .filter(
+            (part) => part !== "body",
+          )
           .join(".")
           .slice(0, 160),
 
@@ -393,10 +558,15 @@ function httpError(response, data) {
         ),
       }));
   } else if (typeof detail === "string") {
-    message = shortText(detail, message);
+    message = shortText(
+      detail,
+      message,
+    );
   } else if (data?.status === "not_ready") {
     code = "not_ready";
-    message = "Application services are not ready yet.";
+
+    message =
+      "Application services are not ready yet.";
   }
 
   return new ApiError(message, {
@@ -407,6 +577,10 @@ function httpError(response, data) {
   });
 }
 
+
+// ============================================================
+// BOUNDED JSON RESPONSE READER
+// ============================================================
 
 async function readJSON(response) {
   const mediaType = (
@@ -420,26 +594,32 @@ async function readJSON(response) {
     mediaType === "application/json" ||
     mediaType.endsWith("+json");
 
-  const declaredSize = Number(
-    response.headers.get("content-length"),
+  const declaredLength = response.headers.get(
+    "content-length",
   );
 
-  if (!isJSON || declaredSize > MAX_RESPONSE_BYTES) {
+  if (
+    declaredLength !== null &&
+    Number(declaredLength) > MAX_RESPONSE_BYTES
+  ) {
     await response.body?.cancel().catch(() => {});
 
-    if (!isJSON && !response.ok) {
+    throw new ApiError(
+      "The API response is too large.",
+      { code: "response_too_large" },
+    );
+  }
+
+  if (!isJSON) {
+    await response.body?.cancel().catch(() => {});
+
+    if (!response.ok) {
       return null;
     }
 
     throw new ApiError(
-      isJSON
-        ? "The API response is too large."
-        : "Expected a JSON response from the API.",
-      {
-        code: isJSON
-          ? "response_too_large"
-          : "invalid_response",
-      },
+      "Expected a JSON response.",
+      { code: "invalid_response" },
     );
   }
 
@@ -448,12 +628,12 @@ async function readJSON(response) {
   }
 
   const reader = response.body.getReader();
+
   const decoder = new TextDecoder("utf-8", {
     fatal: true,
   });
 
   const chunks = [];
-
   let received = 0;
   let complete = false;
 
@@ -477,11 +657,13 @@ async function readJSON(response) {
 
       try {
         chunks.push(
-          decoder.decode(value, { stream: true }),
+          decoder.decode(value, {
+            stream: true,
+          }),
         );
       } catch {
         throw new ApiError(
-          "The API returned invalid UTF-8.",
+          "Invalid UTF-8 in API response.",
           { code: "invalid_response" },
         );
       }
@@ -489,14 +671,17 @@ async function readJSON(response) {
 
     try {
       chunks.push(decoder.decode());
-      return JSON.parse(chunks.join(""));
+
+      return JSON.parse(
+        chunks.join(""),
+      );
     } catch {
       if (!response.ok) {
         return null;
       }
 
       throw new ApiError(
-        "The API returned invalid JSON.",
+        "The server returned invalid JSON.",
         { code: "invalid_response" },
       );
     }
@@ -509,6 +694,10 @@ async function readJSON(response) {
   }
 }
 
+
+// ============================================================
+// MAIN HTTP REQUEST FUNCTION
+// ============================================================
 
 async function request(
   path,
@@ -556,11 +745,12 @@ async function request(
   let body = form;
 
   if (json !== undefined) {
-    headers["Content-Type"] = "application/json";
+    headers["Content-Type"] =
+      "application/json";
+
     body = JSON.stringify(json);
   }
 
-  // FormData uses the browser-generated multipart boundary.
   const controller = new AbortController();
 
   let timedOut = false;
@@ -569,9 +759,11 @@ async function request(
 
   const cancel = () => controller.abort();
 
-  signal?.addEventListener("abort", cancel, {
-    once: true,
-  });
+  signal?.addEventListener(
+    "abort",
+    cancel,
+    { once: true },
+  );
 
   const timer = setTimeout(() => {
     if (!controller.signal.aborted) {
@@ -597,10 +789,15 @@ async function request(
 
     receivedStatus = response.status;
 
-    const data = await readJSON(response);
+    const data = await readJSON(
+      response,
+    );
 
     if (!response.ok) {
-      throw httpError(response, data);
+      throw httpError(
+        response,
+        data,
+      );
     }
 
     const invalidShape =
@@ -610,7 +807,7 @@ async function request(
 
     if (invalidShape) {
       throw new ApiError(
-        "The API returned an unexpected response shape.",
+        "Unexpected API response shape.",
         { code: "invalid_response" },
       );
     }
@@ -634,7 +831,7 @@ async function request(
       error = cause;
     } else {
       error = new ApiError(
-        "The connection to AutoAudit was interrupted. Check the server.",
+        "The connection to AutoAudit was interrupted.",
         {
           code: "network_error",
           cause,
@@ -642,9 +839,13 @@ async function request(
       );
     }
 
-    error.status = receivedStatus;
+    error.status =
+      error.status || receivedStatus;
 
-    // Losing a POST response does not mean the action was rolled back.
+    // A lost POST response does not prove failure.
+    // The browser should check the saved request ID
+    // before asking the user to submit it again.
+
     error.outcomeUnknown =
       method !== "GET" &&
       started &&
@@ -660,12 +861,25 @@ async function request(
     throw error;
   } finally {
     clearTimeout(timer);
-    signal?.removeEventListener("abort", cancel);
+
+    signal?.removeEventListener(
+      "abort",
+      cancel,
+    );
   }
 }
 
 
+// ============================================================
+// PUBLIC API METHODS
+// ============================================================
+
 export const api = Object.freeze({
+
+  // ----------------------------------------------------------
+  // HEALTH AND READINESS
+  // ----------------------------------------------------------
+
   async getHealth(options) {
     return request(
       "health",
@@ -680,6 +894,11 @@ export const api = Object.freeze({
     );
   },
 
+
+  // ----------------------------------------------------------
+  // DATASET UPLOAD
+  // ----------------------------------------------------------
+
   async uploadDataset(file, options) {
     if (!(file instanceof File)) {
       throw inputError(
@@ -689,10 +908,12 @@ export const api = Object.freeze({
     }
 
     if (
-      !file.name.trim().toLowerCase().endsWith(".csv")
+      !file.name.trim()
+        .toLowerCase()
+        .endsWith(".csv")
     ) {
       throw inputError(
-        "Choose a file with a .csv extension.",
+        "Choose a .csv file.",
         "file",
       );
     }
@@ -702,22 +923,38 @@ export const api = Object.freeze({
       file.size > MAX_CSV_BYTES
     ) {
       throw inputError(
-        "Choose a nonempty CSV of at most 25 MB.",
+        "CSV must be nonempty and at most 25 MB.",
         "file",
       );
     }
 
     const form = new FormData();
-    form.append("file", file, file.name);
 
-    return request("datasets", {
-      ...requestOptions(options, 120_000),
-      method: "POST",
-      form,
-    });
+    form.append(
+      "file",
+      file,
+      file.name,
+    );
+
+    return request(
+      "datasets",
+      {
+        ...requestOptions(options, 120_000),
+        method: "POST",
+        form,
+      },
+    );
   },
 
-  async listDatasets({ limit = 50, ...options } = {}) {
+
+  // ----------------------------------------------------------
+  // DATASET HISTORY AND PROFILE
+  // ----------------------------------------------------------
+
+  async listDatasets({
+    limit = 50,
+    ...options
+  } = {}) {
     return request(
       `datasets?limit=${listLimit(limit)}`,
       {
@@ -741,15 +978,66 @@ export const api = Object.freeze({
     );
   },
 
-  async createRun(payload, options) {
-    return request("runs", {
-      ...requestOptions(options),
-      method: "POST",
-      json: runPayload(payload),
-    });
+
+  // ----------------------------------------------------------
+  // NEW: GOAL-ONLY PROJECT BLUEPRINT GENERATION
+  // ----------------------------------------------------------
+
+  async createProjectPlan(payload, options) {
+    return request(
+      "projects/plan",
+      {
+        ...requestOptions(
+          options,
+          PLANNING_TIMEOUT_MS,
+        ),
+
+        method: "POST",
+
+        json: projectPlanPayload(
+          payload,
+        ),
+      },
+    );
   },
 
-  async listRuns({ limit = 50, ...options } = {}) {
+
+  // ----------------------------------------------------------
+  // NEW: FETCH SAVED PROJECT BLUEPRINT
+  // ----------------------------------------------------------
+
+  async getProjectPlan(runId, options) {
+    return request(
+      `projects/plan/${uuid(runId, "run_id")}`,
+      requestOptions(options),
+    );
+  },
+
+
+  // ----------------------------------------------------------
+  // EXISTING: DATASET-BACKED ML WORKFLOW
+  // ----------------------------------------------------------
+
+  async createRun(payload, options) {
+    return request(
+      "runs",
+      {
+        ...requestOptions(options),
+        method: "POST",
+        json: runPayload(payload),
+      },
+    );
+  },
+
+
+  // ----------------------------------------------------------
+  // RUN HISTORY
+  // ----------------------------------------------------------
+
+  async listRuns({
+    limit = 50,
+    ...options
+  } = {}) {
     return request(
       `runs?limit=${listLimit(limit)}`,
       {
@@ -766,6 +1054,23 @@ export const api = Object.freeze({
     );
   },
 
+
+  // ----------------------------------------------------------
+  // NEW: GENERATED PROJECT FILE PROGRESS
+  // ----------------------------------------------------------
+
+  async getProjectProgress(runId, options) {
+    return request(
+      `runs/${uuid(runId, "run_id")}/project`,
+      requestOptions(options),
+    );
+  },
+
+
+  // ----------------------------------------------------------
+  // HUMAN-IN-THE-LOOP REVIEW
+  // ----------------------------------------------------------
+
   async submitReview(runId, decision, options) {
     return request(
       `runs/${uuid(runId, "run_id")}/reviews`,
@@ -777,6 +1082,11 @@ export const api = Object.freeze({
     );
   },
 
+
+  // ----------------------------------------------------------
+  // RETRY FAILED / INTERRUPTED RUN
+  // ----------------------------------------------------------
+
   async retryRun(runId, options) {
     return request(
       `runs/${uuid(runId, "run_id")}/retry`,
@@ -786,4 +1096,5 @@ export const api = Object.freeze({
       },
     );
   },
+
 });
